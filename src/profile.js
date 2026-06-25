@@ -13,7 +13,8 @@
     searches: [],          // recent search strings
     attended: [],          // event ids marked attended
     plus: false,           // Eventually Plus member
-    notify: false          // web notifications enabled
+    notify: false,         // web notifications enabled
+    language: 'en'         // Host language (default English)
   };
 
   function load() {

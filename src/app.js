@@ -113,8 +113,13 @@
     selectedDate: function () { return selectedDate; }
   });
   const music = new window.EventuallyMusic();   // duckable bed, swaps to a real file if provided
+  const I18n = window.EventuallyI18n;
   new window.EventuallyAIHost(document.getElementById('ai-host'), {
-    getLine: function () { return narrator.next(); },
+    getLine: function () {                       // localize the structured line to the user's language
+      const line = narrator.next();
+      const lang = P.get().language || 'en';
+      return { text: I18n.format(line, lang), kind: line.kind, sponsor: line.sponsor, lang: I18n.bcp(lang), rtl: I18n.isRTL(lang) };
+    },
     onPlay: function () { music.start(); },        // radio bed on when the Host talks
     onPause: function () { music.stop(); },
     onSpeakStart: function () { music.duck(true); },   // duck under the voice
@@ -483,6 +488,9 @@
       return '<button class="pf-rec" data-id="' + e.id + '"><span class="dot" style="background:' + e.categoryColor + '"></span>' +
         esc(e.name) + '<small>' + esc(e.city) + '</small></button>';
     }).join('') : '<p class="pf-empty">Set your location and interests for tailored picks.</p>';
+    profileEl.querySelector('.pf-langs').innerHTML = I18n.LANGS.map(function (l) {
+      return '<button class="chip' + ((p.language || 'en') === l.code ? ' on' : '') + '" data-lang="' + l.code + '">' + l.label + '</button>';
+    }).join('');
     profileEl.querySelector('.pf-notify').classList.toggle('on', p.notify);
     profileEl.querySelector('.pf-notify .tg-state').textContent = p.notify ? 'On' : 'Off';
     profileEl.querySelector('.pf-filter').classList.toggle('on', interestFilterActive);
@@ -498,6 +506,13 @@
   profileEl.addEventListener('click', function (e) {
     const chip = e.target.closest('.chip[data-cat]');
     if (chip) { P.toggleInterest(chip.dataset.cat); chip.classList.toggle('on'); refreshMarkers(); renderProfile(); return; }
+    const lang = e.target.closest('.chip[data-lang]');
+    if (lang) {
+      P.set({ language: lang.dataset.lang }); renderProfile();
+      const l = I18n.LANGS.find(function (x) { return x.code === lang.dataset.lang; });
+      window.EventuallyToast('Host language: ' + (l ? l.label : lang.dataset.lang) + '. Press ▶ to hear it.');
+      return;
+    }
     const rec = e.target.closest('.pf-rec[data-id]');
     if (rec) {
       const ev = D.getById(rec.dataset.id);

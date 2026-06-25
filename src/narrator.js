@@ -59,40 +59,36 @@
 
     const voices = [
       // News anchor — the worldwide pulse
-      function () {
-        return { text: 'Welcome to Eventually. There are currently ' +
-          worldwideLive().toLocaleString() + ' live events happening worldwide.', kind: 'anchor' };
-      },
-      // Concierge — personalized
+      // News anchor — worldwide pulse
+      function () { return { kind: 'welcome', data: { count: worldwideLive() } }; },
+      // Concierge — personalized greeting (localized name/category downstream)
       function () {
         const p = ctx.profile.get();
-        const name = p.name ? p.name : 'there';
         const interests = ctx.profile.effectiveInterests(ctx.data.getById);
-        const loc = p.location;
-        const recs = nearby(interests, loc).slice(0, 3);
-        if (recs.length && loc) {
+        const recs = nearby(interests, p.location).slice(0, 3);
+        if (recs.length && p.location) {
           const top = recs[0];
-          const within = top.dist != null ? (' within ' + Math.max(1, km2mi(recs[2] ? recs[2].dist : top.dist)) + ' miles') : '';
-          const kind = interests.length ? (interests[0].toLowerCase() + ' ') : '';
-          return { text: 'Good ' + partOfDay() + ', ' + name + '. Based on your interests, I found ' +
-            recs.length + ' live ' + kind + 'events' + within + ', including ' + top.e.name + ' in ' + top.e.city + '.', kind: 'concierge' };
+          return { kind: 'greeting', data: {
+            part: partOfDay(), name: p.name || null, hasRecs: true,
+            k: recs.length, cat: interests.length ? interests[0] : top.e.category,
+            mi: Math.max(1, km2mi(recs[2] ? recs[2].dist : top.dist)),
+            event: top.e.name, city: top.e.city } };
         }
-        return { text: 'Good ' + partOfDay() + ', ' + name + '. Set your location and interests and I\'ll line up events made for you.', kind: 'concierge' };
+        return { kind: 'greeting', data: { part: partOfDay(), name: p.name || null, hasRecs: false } };
       },
-      // Radio DJ — spotlight on a popular event
+      // Radio DJ — spotlight
       function () {
         const live = liveEvents().sort(function (a, b) { return ctx.data.popularity(b) - ctx.data.popularity(a); });
-        if (!live.length) return { text: 'The globe is quiet on this date — scrub the timeline to find the next wave of events.', kind: 'dj' };
+        if (!live.length) return { kind: 'tip', data: {} };
         const e = pick(live.slice(0, 5));
-        return { text: 'Spinning the spotlight onto ' + e.name + ' in ' + e.city +
-          ' — ' + e.attending.toLocaleString() + ' people are going right now.', kind: 'dj' };
+        return { kind: 'spotlight', data: { event: e.name, city: e.city, going: e.attending } };
       },
       // Tour guide — countdown
       function () {
         const live = liveEvents();
-        if (!live.length) return { text: 'Tap any glowing marker to see everything happening at that spot.', kind: 'guide' };
+        if (!live.length) return { kind: 'tip', data: {} };
         const e = pick(live);
-        return { text: 'The ' + e.name + ' kicks off in ' + e.startsInMin + ' minutes in ' + e.city + '.', kind: 'guide' };
+        return { kind: 'countdown', data: { event: e.name, min: e.startsInMin, city: e.city } };
       },
       // News anchor — regional roundup
       function () {
@@ -104,29 +100,26 @@
           byRegion[r][e.category] = (byRegion[r][e.category] || 0) + 1;
         });
         const regions = Object.keys(byRegion);
-        if (!regions.length) return { text: 'No events are live on this date — but the week ahead is filling up fast.', kind: 'anchor' };
+        if (!regions.length) return { kind: 'tip', data: {} };
         const r = pick(regions);
         const cat = Object.keys(byRegion[r]).sort(function (a, b) { return byRegion[r][b] - byRegion[r][a]; })[0];
-        const n = byRegion[r][cat];
-        return { text: n + ' major ' + cat.toLowerCase() + ' event' + (n === 1 ? ' is' : 's are') +
-          ' currently underway in ' + r + '.', kind: 'anchor' };
+        return { kind: 'region', data: { n: byRegion[r][cat], cat: cat, region: r } };
       },
       // DJ — trending
       function () {
         const top = ctx.data.getEvents().slice().sort(function (a, b) { return ctx.data.popularity(b) - ctx.data.popularity(a); })[0];
-        if (!top) return { text: 'Eventually — good things land, eventually.', kind: 'dj' };
-        return { text: 'Trending right now: ' + top.name + ' in ' + top.city +
-          ', climbing fast with ' + top.likes.toLocaleString() + ' likes.', kind: 'dj' };
+        if (!top) return { kind: 'tip', data: {} };
+        return { kind: 'trending', data: { event: top.name, city: top.city, likes: top.likes } };
       }
     ];
 
     return {
+      // Emits a STRUCTURED line: { kind, data, sponsor? }. The i18n layer renders text.
       next: function () {
-        // Occasionally insert a (rate-limited) sponsor read between voices.
         sinceSponsor++;
         if (sinceSponsor >= 4) {
           const s = ctx.monetize.nextSponsorLine(ctx.profile.get().plus);
-          if (s) { sinceSponsor = 0; return { text: s.text, kind: 'sponsor', sponsor: s.sponsor }; }
+          if (s) { sinceSponsor = 0; return { kind: 'sponsor', data: { sponsor: s.sponsor }, sponsor: s.sponsor }; }
         }
         const line = voices[i % voices.length]();
         i++;

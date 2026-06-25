@@ -56,8 +56,10 @@
     const line = this.getLine();
     if (!line) return;
     this.current = line;
+    this._lang = line.lang || 'en-US';                 // BCP-47 for the utterance
     this.sponEl.style.display = line.kind === 'sponsor' ? '' : 'none';
     this.el.querySelector('.ah-caption').classList.toggle('is-sponsor', line.kind === 'sponsor');
+    this.textEl.setAttribute('dir', line.rtl ? 'rtl' : 'ltr');   // Arabic etc.
     // fade swap
     this.textEl.style.opacity = 0;
     const self = this;
@@ -78,10 +80,14 @@
       window.speechSynthesis.cancel();
       const u = new SpeechSynthesisUtterance(text);
       u.rate = 1.0; u.pitch = 1.0; u.volume = 1.0;
+      u.lang = this._lang || 'en-US';
+      const v = this._voiceFor(u.lang); if (v) u.voice = v;
       u.onstart = function () { self.amp = 0.6; self.onSpeakStart(); };   // duck music under voice
       u.onboundary = function () { self.amp = 0.55 + Math.random() * 0.4; };
       u.onend = afterSegment;
       u.onerror = afterSegment;
+      self._utter = u;                       // keep a ref so the engine doesn't GC events
+      try { window.speechSynthesis.resume(); } catch (e) {}   // iOS can leave it paused
       window.speechSynthesis.speak(u);
     } else {
       // no speech engine: simulate a read so the music rhythm still works
@@ -98,6 +104,7 @@
     this.speaking = true;
     this.icPlay.style.display = 'none';
     this.icPause.style.display = '';
+    this._unlockSpeech();                   // MUST run inside the tap to enable mobile TTS
     this.onPlay();                          // music starts and plays alone first
     if (this._timer) { clearInterval(this._timer); this._timer = null; }   // pause silent ticker
     const self = this;
@@ -110,6 +117,36 @@
 
   AIHost.prototype._jitter = function (base, spread) {
     return Math.max(1500, base + (Math.random() * 2 - 1) * spread);
+  };
+
+  // Pick a browser voice matching the language (free, on-device). Falls back to
+  // the engine default if no localized voice is installed on the device.
+  AIHost.prototype._voiceFor = function (bcp) {
+    if (!('speechSynthesis' in window)) return null;
+    const pref = (bcp || 'en').slice(0, 2).toLowerCase();
+    const vs = window.speechSynthesis.getVoices() || [];
+    let exact = null, lang = null;
+    for (let i = 0; i < vs.length; i++) {
+      const vl = (vs[i].lang || '').toLowerCase();
+      if (vl === (bcp || '').toLowerCase()) { exact = vs[i]; break; }
+      if (!lang && vl.slice(0, 2) === pref) lang = vs[i];
+    }
+    return exact || lang || null;
+  };
+
+  // Mobile (esp. iOS Safari) only allows speech that begins inside a user gesture,
+  // or after one has "unlocked" the engine. Our first real line is on a timer, so
+  // we prime the engine here with a silent micro-utterance while still in the tap.
+  AIHost.prototype._unlockSpeech = function () {
+    if (this._unlocked || !('speechSynthesis' in window)) return;
+    try {
+      window.speechSynthesis.resume();
+      const u = new SpeechSynthesisUtterance(' ');   // non-breaking space
+      u.volume = 0; u.rate = 1;
+      this._unlockUtter = u;                               // hold a ref (GC guard)
+      window.speechSynthesis.speak(u);
+      this._unlocked = true;
+    } catch (e) {}
   };
   AIHost.prototype.stop = function () {
     this.speaking = false;
