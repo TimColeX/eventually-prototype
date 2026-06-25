@@ -15,9 +15,11 @@
   }
 
   const SOURCES = {
-    eventbrite:  { label: 'Eventbrite',   color: '#f6682f' },
-    ticketmaster:{ label: 'Ticketmaster', color: '#026cdf' },
-    orbit:       { label: 'Eventually Native', color: '#21d4fd' }
+    eventbrite:  { label: 'Eventbrite',   color: '#CB5A3C', badge: 'Official listing' },
+    ticketmaster:{ label: 'Ticketmaster', color: '#8A3B1E', badge: 'Official listing' },
+    meetup:      { label: 'Meetup',       color: '#B5722F', badge: 'Community event' },
+    native:      { label: 'Eventually',   color: '#21d4fd', badge: '' },
+    orbit:       { label: 'Eventually Native', color: '#21d4fd', badge: '' }
   };
 
   // Warm "Clay" palette tints — every marker stays in the brand family.
@@ -131,6 +133,75 @@
     };
   });
 
+  /* ---- Multi-source feed + live deduplication ---------------------------------
+   * Each event becomes one or more raw SOURCE records (the same event can appear
+   * across platforms). The dedup engine clusters them back together at load.     */
+  const PRICE_BY_CAT = { Music: 35, Tech: 25, Sports: 40, Art: 15, Food: 10, Film: 18, Talks: 0 };
+  const PLATFORM_URL = {
+    eventbrite: function (id) { return 'https://www.eventbrite.com/e/' + id; },
+    meetup: function (id) { return 'https://www.meetup.com/events/' + id; },
+    ticketmaster: function (id) { return 'https://www.ticketmaster.com/event/' + id; },
+    native: function () { return null; }
+  };
+  // Same event also listed on other platforms (price + small time drift to test the engine).
+  const MULTI = {
+    'Neon Skyline Festival':  [{ source: 'ticketmaster', price: 45 }, { source: 'eventbrite', price: 48, hr: 1 }],
+    'Vancouver Jazz Festival':[{ source: 'ticketmaster', price: 35 }, { source: 'eventbrite', price: 39, hr: -1 }],
+    'Champions Final':        [{ source: 'ticketmaster', price: 25 }, { source: 'eventbrite', price: 30, hr: 2 }],
+    'Quantum Dev Conf':       [{ source: 'eventbrite', price: 20 }, { source: 'meetup', price: 0, hr: 1 }],
+    'Future of Web':          [{ source: 'eventbrite', price: 15 }, { source: 'meetup', price: 0, hr: -2 }],
+    'Street Food Worlds':     [{ source: 'eventbrite', price: 10 }, { source: 'meetup', price: 0, hr: 1 }],
+    'Copacabana Beat':        [{ source: 'eventbrite', price: 25 }, { source: 'ticketmaster', price: 28, hr: 2 }]
+  };
+
+  let _sid = 0;
+  const SOURCE_RECORDS = [];
+  EVENTS.forEach(function (E) {
+    let specs;
+    if (E.source === 'orbit') specs = [{ source: 'native', price: null }];
+    else if (MULTI[E.name]) specs = MULTI[E.name];
+    else specs = [{ source: E.source, price: PRICE_BY_CAT[E.category] }];
+    specs.forEach(function (sp, k) {
+      const sid = 'src_' + (++_sid);
+      const src = sp.source;
+      SOURCE_RECORDS.push({
+        source_id: sid, cluster_id: null, source: src,
+        sourceLabel: SOURCES[src].label, badge: SOURCES[src].badge,
+        url: PLATFORM_URL[src](sid),
+        price: sp.price, priceLabel: sp.price == null ? 'Register' : (sp.price === 0 ? 'Free' : '$' + sp.price),
+        organizer: (src === 'native' ? 'Eventually' : (E.city + ' ' + E.category)) + (k ? ' Group' : ' Events'),
+        last_updated: Date.now() - Math.floor(Math.random() * 72) * 3600000,
+        title: E.name, city: E.city,
+        lat: E.lat, lon: E.lon,            // duplicates share the venue's coordinates
+        startMs: E.date.getTime() + (sp.hr || 0) * 3600000,
+        description: E.description, category: E.category, _evid: E.id
+      });
+    });
+  });
+
+  const DEDUP = window.EventuallyDedup.cluster(SOURCE_RECORDS);
+
+  EVENTS.forEach(function (E) {
+    const grp = DEDUP.groups.find(function (g) { return g.sources.some(function (s) { return s._evid === E.id; }); });
+    const recs = (grp ? grp.sources : []).slice().sort(function (a, b) {
+      const pa = a.price == null ? 1e9 : a.price, pb = b.price == null ? 1e9 : b.price;
+      return pa - pb;                       // cheapest first (register/native last)
+    });
+    E.sources = recs;
+    E.sourceCount = recs.length;
+    E.is_native = recs.some(function (s) { return s.source === 'native'; });
+    E.topScore = grp ? grp.topScore : 1;
+    E.displaySource = grp ? grp.display.source : (recs[0] && recs[0].source);
+    let best = null, bp = Infinity;
+    if (recs.length > 1) recs.forEach(function (s) { if (s.price != null && s.price < bp) { bp = s.price; best = s.source_id; } });
+    E.cheapestId = best;
+  });
+
+  const SOURCE_STATS = {
+    sources: SOURCE_RECORDS.length, events: EVENTS.length,
+    merged: SOURCE_RECORDS.length - DEDUP.groups.length, comparisons: DEDUP.comparisons
+  };
+
   function typeForDate(evt, selectedDate) {
     // Same calendar day as selected date => LIVE (pillar). Future => UPCOMING (dot).
     const a = evt.date, b = selectedDate;
@@ -194,8 +265,19 @@
     popularity: popularity,
     getClusters: function () { return CLUSTERS; },
     buildClusters: buildClusters,
+    getSourceStats: function () { return SOURCE_STATS; },
     addEvent: function (evt) {
       evt.id = 'evt_' + (++_id);
+      // a coordinator-published event is native, single-source
+      evt.sources = [{
+        source_id: 'src_native_' + _id, source: 'native', sourceLabel: 'Eventually', badge: '',
+        url: evt.ticketUrl || null, price: null, priceLabel: 'Register',
+        organizer: 'Eventually', last_updated: Date.now(),
+        title: evt.name, city: evt.city, lat: evt.lat, lon: evt.lon,
+        startMs: evt.date.getTime(), description: evt.description, category: evt.category, _evid: evt.id
+      }];
+      evt.sourceCount = 1; evt.is_native = true; evt.topScore = 1;
+      evt.displaySource = 'native'; evt.cheapestId = null;
       EVENTS.push(evt);
       buildClusters();
       return evt;

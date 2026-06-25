@@ -112,6 +112,9 @@
   <!-- coordinator portal -->
   <div id="coordinator" class="coordinator"></div>
 
+  <!-- full event detail (tap-through from a card) -->
+  <aside id="event" class="evdetail"><div class="evd-scroll"></div></aside>
+
   <!-- profile / "You" panel -->
   <aside id="profile" class="profile">
     <header class="pf-head">
@@ -175,6 +178,7 @@
   <div id="toast" class="toast"></div>
 
   <!-- scripts: classic (file:// friendly), dependency order -->
+  <script src="src/dedup.js"></script>
   <script src="src/data.js"></script>
   <script src="src/landdata.js"></script>
   <script src="src/profile.js"></script>

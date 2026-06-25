@@ -1,8 +1,8 @@
 /* Eventually — service worker. Offline-first cache of the app shell. */
-const CACHE = 'eventually-v19';
+const CACHE = 'eventually-v23';
 const ASSETS = [
   './', './index.html', './styles/main.css',
-  './src/data.js', './src/landdata.js', './src/profile.js', './src/monetize.js',
+  './src/dedup.js', './src/data.js', './src/landdata.js', './src/profile.js', './src/monetize.js',
   './src/narrator.js', './src/music.js', './src/globe.js', './src/timeline.js',
   './src/aihost.js', './src/coordinator.js', './src/app.js',
   './manifest.webmanifest', './assets/icon.svg'

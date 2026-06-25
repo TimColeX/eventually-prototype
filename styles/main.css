@@ -189,10 +189,15 @@ body {
 /* compact event card */
 .ev {
   display: flex; gap: 0; border-radius: 14px; overflow: hidden;
-  flex: 0 0 auto;
+  flex: 0 0 auto; width: 100%; text-align: left; cursor: pointer; padding: 0; color: inherit;
+  font-family: var(--font);
   background: var(--paper); border: 1px solid var(--line); transition: border-color .18s, box-shadow .18s;
 }
-.ev:hover { border-color: var(--line-2); box-shadow: var(--shadow); }
+.ev:hover { border-color: var(--clay); box-shadow: var(--shadow); }
+.ev-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 10px; }
+.ev-srcs { font-family: var(--mono); font-size: 10.5px; letter-spacing: .03em; color: var(--ember); }
+.ev-srcs.native { color: var(--hint); }
+.ev-view { font-size: 12.5px; font-weight: 700; color: var(--clay); margin-left: auto; }
 .ev.focus { border-color: var(--clay); box-shadow: 0 0 0 2px rgba(203,90,60,.25); }
 .ev-banner { width: 6px; flex: none; }
 .ev-main { flex: 1; padding: 13px 15px; min-width: 0; }
@@ -554,6 +559,47 @@ body.has-ad .toast { bottom: 144px; }
 .contact-form input:focus, .contact-form textarea:focus { border-color: var(--clay); }
 .contact-form button[type=submit] { padding: 12px; border-radius: 11px; cursor: pointer; background: var(--clay); color: var(--cream); border: 0; font-family: var(--font); font-weight: 700; font-size: 14px; }
 
+/* ---------- full event detail (dedup view) ---------- */
+.evdetail {
+  position: fixed; top: 78px; right: -480px; z-index: 50;
+  width: 420px; max-width: calc(100vw - 28px); max-height: calc(100vh - 180px);
+  display: flex; flex-direction: column;
+  background: var(--cream); border: 1px solid var(--line); border-radius: 20px;
+  overflow: hidden; box-shadow: var(--shadow-lg); transition: right .35s cubic-bezier(.22,1,.36,1);
+}
+.evdetail.open { right: 18px; }
+.evd-scroll { overflow-y: auto; }
+.evd-banner { position: relative; height: 120px; display: flex; align-items: flex-end; padding: 14px; }
+.evd-banner::after { content: ''; position: absolute; inset: 0; background: linear-gradient(to top, rgba(33,26,21,.5), transparent 60%); }
+.evd-back, .evd-x { position: absolute; top: 12px; z-index: 2; border: 0; cursor: pointer; background: rgba(33,26,21,.42); color: #fff; border-radius: 999px; }
+.evd-back { left: 12px; padding: 6px 12px; font-family: var(--font); font-size: 13px; font-weight: 600; }
+.evd-x { right: 12px; width: 30px; height: 30px; font-size: 14px; }
+.evd-cat { position: relative; z-index: 1; font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: #fff; background: rgba(33,26,21,.4); padding: 4px 10px; border-radius: 999px; }
+.evd-body { padding: 16px 18px 22px; }
+.evd-badges { display: flex; gap: 8px; margin-bottom: 8px; }
+.evd-title { margin: 2px 0 6px; font-size: 23px; font-weight: 800; letter-spacing: -0.03em; line-height: 1.15; }
+.evd-meta { margin: 0 0 12px; font-family: var(--mono); font-size: 11.5px; letter-spacing: .03em; text-transform: uppercase; color: var(--faint); }
+.evd-dedup { background: #faf3ea; border: 1px solid var(--line); border-radius: 12px; padding: 10px 13px; margin-bottom: 14px; font-family: var(--mono); font-size: 11.5px; color: var(--ember); display: flex; flex-direction: column; gap: 4px; }
+.evd-dedup small { font-family: var(--font); font-size: 11.5px; color: var(--muted); letter-spacing: 0; }
+.evd-desc { margin: 0 0 16px; font-size: 14px; line-height: 1.6; color: var(--muted); }
+.evd-actions { display: flex; gap: 8px; margin-bottom: 18px; }
+.evd-section { border-top: 1px solid var(--line); padding-top: 16px; }
+.evd-sec-h { font-family: var(--mono); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--faint); margin-bottom: 12px; }
+.avail-list { display: flex; flex-direction: column; gap: 8px; }
+.avail-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; padding: 12px 14px; border-radius: 12px; cursor: pointer; background: var(--paper); border: 1px solid var(--line-2); font-family: var(--font); transition: .15s; }
+.avail-row:hover { border-color: var(--clay); box-shadow: var(--shadow); }
+.avail-row.cheapest { border-color: var(--clay); background: rgba(203,90,60,.06); }
+.avail-left { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.avail-left strong { font-size: 14px; color: var(--ink); }
+.avail-badge { font-family: var(--mono); font-size: 9px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); background: #efe4d4; padding: 2px 6px; border-radius: 5px; }
+.avail-right { display: flex; align-items: center; gap: 9px; flex: none; }
+.avail-tag { font-family: var(--mono); font-size: 9px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: var(--cream); background: var(--clay); padding: 2px 7px; border-radius: 5px; }
+.avail-price { font-weight: 800; font-size: 14.5px; color: var(--ink); }
+.avail-go { color: var(--clay); font-weight: 700; }
+.native-cta { width: 100%; padding: 14px; border-radius: 12px; cursor: pointer; background: var(--clay); color: var(--cream); border: 0; font-family: var(--font); font-weight: 700; font-size: 15px; }
+.native-cta:hover { background: #b94e32; }
+.evd-note { margin: 11px 0 0; font-size: 12px; color: var(--hint); line-height: 1.5; }
+
 /* ---------- responsive ---------- */
 @media (max-width: 760px) {
   .topbar { flex-wrap: wrap; gap: 10px; padding: 12px 14px; }
@@ -565,7 +611,7 @@ body.has-ad .toast { bottom: 144px; }
   .timeline { bottom: 82px; }
   .globe-controls { bottom: 138px; right: 14px; }
   .ctl { width: 38px; height: 38px; }
-  .place.open, .profile.open { right: 50%; transform: translateX(50%); top: 70px; bottom: 130px; max-height: none; width: calc(100vw - 24px); }
+  .place.open, .profile.open, .evdetail.open { right: 50%; transform: translateX(50%); top: 70px; bottom: 130px; max-height: none; width: calc(100vw - 24px); }
   body.has-ad .ai-host { bottom: 66px; }
   body.has-ad .timeline { bottom: 128px; }
   body.has-ad .globe-controls { bottom: 188px; }

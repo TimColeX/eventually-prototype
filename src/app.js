@@ -204,9 +204,11 @@
       ? '<span class="badge live">● Live today</span>'
       : '<span class="badge soon">Upcoming</span>';
     const featured = ev.sponsored ? '<span class="badge featured">★ Featured</span>' : '';
-    const saved = P.isSaved(ev.id);
+    const srcs = ev.sourceCount > 1
+      ? '<span class="ev-srcs">◇ Found on ' + ev.sourceCount + ' sources</span>'
+      : (ev.is_native ? '<span class="ev-srcs native">On Eventually</span>' : '');
     return '' +
-      '<article class="ev' + (ev.sponsored ? ' is-featured' : '') + '" data-id="' + ev.id + '">' +
+      '<button class="ev' + (ev.sponsored ? ' is-featured' : '') + '" data-open="' + ev.id + '">' +
         '<div class="ev-banner" style="background:' + ev.categoryColor + '"></div>' +
         '<div class="ev-main">' +
           '<div class="ev-top">' +
@@ -214,17 +216,11 @@
             featured + badge +
           '</div>' +
           '<h4 class="ev-title">' + esc(ev.name) + '</h4>' +
-          '<p class="ev-date">' + dateLabel + '  ·  ' + esc(ev.sourceLabel) + '</p>' +
+          '<p class="ev-date">' + dateLabel + '  ·  ' + esc(ev.city) + '</p>' +
           '<p class="ev-desc">' + esc(ev.description) + '</p>' +
-          '<div class="ev-actions">' +
-            '<button class="ev-like' + (ev.userLiked ? ' on' : '') + '" data-act="like">♥ <span class="n">' + ev.likes.toLocaleString() + '</span></button>' +
-            '<button class="ev-attend' + (ev.userAttending ? ' on' : '') + '" data-act="attend">✓ <span class="n">' + ev.attending.toLocaleString() + '</span></button>' +
-            '<button class="ev-save' + (saved ? ' on' : '') + '" data-act="save" title="Save event" aria-label="Save event">' + (saved ? '★' : '☆') + '</button>' +
-            (ev.ticketUrl ? '<button class="ev-ticket" data-act="ticket">Tickets ↗</button>'
-                          : '<span class="ev-native">On Eventually</span>') +
-          '</div>' +
+          '<div class="ev-foot">' + srcs + '<span class="ev-view">View ›</span></div>' +
         '</div>' +
-      '</article>';
+      '</button>';
   }
 
   // Revenue 4 — a location-based partner suggestion shown in the popup (non-Plus).
@@ -266,40 +262,100 @@
     place.classList.remove('open'); activeClusterId = null;
   });
 
-  // Delegated like / attend / ticket on the compact cards.
+  // Tap a compact card → open the full event detail (with "Available on").
   placeList.addEventListener('click', function (e) {
-    const btn = e.target.closest('[data-act]');
-    if (!btn) return;
-    const art = btn.closest('.ev');
-    const ev = D.getById(art.dataset.id);
-    const act = btn.dataset.act;
-    if (act === 'ticket') {                        // Revenue 5 — affiliate tracking
-      ev.clicks++;
-      const n = M.trackAffiliate();
-      window.open(M.affiliate(ev.ticketUrl), '_blank', 'noopener');
-      window.EventuallyToast('Opening tickets — referral tracked (demo · ' + n + ' total).');
+    const card = e.target.closest('[data-open]');
+    if (card) openEvent(card.dataset.open);
+  });
+
+  /* ---------- full event detail (dedup view: title, desc, "Available on") ---------- */
+  const eventEl = document.getElementById('event');
+  const eventScroll = eventEl.querySelector('.evd-scroll');
+  let activeEventId = null;
+
+  function sourceRowHTML(ev, s) {
+    const cheapest = s.source_id === ev.cheapestId;
+    const badge = s.badge ? '<span class="avail-badge">' + esc(s.badge) + '</span>' : '';
+    return '<button class="avail-row' + (cheapest ? ' cheapest' : '') + '" data-src="' + s.source_id + '">' +
+      '<span class="avail-left"><strong>' + esc(s.sourceLabel) + '</strong>' + badge + '</span>' +
+      '<span class="avail-right">' + (cheapest ? '<span class="avail-tag">Cheapest</span>' : '') +
+      '<span class="avail-price">' + esc(s.priceLabel) + '</span><span class="avail-go">↗</span></span></button>';
+  }
+
+  function openEvent(id) {
+    const ev = D.getById(id); if (!ev) return;
+    activeEventId = id; ev.clicks++;
+    const type = D.typeForDate(ev, selectedDate);
+    const dateLabel = ev.date.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
+    const timeLabel = ev.date.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+    const badge = type === 'live' ? '<span class="badge live">● Live today</span>'
+      : (type === 'past' ? '<span class="badge past">Past</span>' : '<span class="badge soon">Upcoming</span>');
+    const featured = ev.sponsored ? '<span class="badge featured">★ Featured</span>' : '';
+    const transparency = ev.sourceCount > 1
+      ? '<div class="evd-dedup">◇ Found on ' + ev.sourceCount + ' sources · best match ' + Math.round(ev.topScore * 100) + '%' +
+        '<small>Listings grouped automatically — every original source is preserved.</small></div>' : '';
+    let avail;
+    if (ev.is_native) {
+      avail = '<div class="evd-section"><div class="evd-sec-h">Hosted on Eventually</div>' +
+        '<button class="native-cta" data-register="' + ev.id + '">Register on this platform</button>' +
+        '<p class="evd-note">Hosted natively on Eventually — no external ticketing needed.</p></div>';
+    } else {
+      avail = '<div class="evd-section"><div class="evd-sec-h">Available on</div>' +
+        '<div class="avail-list">' + ev.sources.map(function (s) { return sourceRowHTML(ev, s); }).join('') + '</div>' +
+        '<p class="evd-note">Prices and links come straight from each source — pick where you buy.</p></div>';
+    }
+    eventScroll.innerHTML =
+      '<div class="evd-banner" style="background:linear-gradient(135deg,' + ev.categoryColor + ',#211A15)">' +
+        '<button class="evd-back" aria-label="Back">‹ Back</button>' +
+        '<button class="evd-x" aria-label="Close">✕</button>' +
+        '<span class="evd-cat">' + esc(ev.category) + '</span>' +
+      '</div>' +
+      '<div class="evd-body">' +
+        '<div class="evd-badges">' + featured + badge + '</div>' +
+        '<h2 class="evd-title">' + esc(ev.name) + '</h2>' +
+        '<p class="evd-meta">' + esc(dateLabel) + ' · ' + timeLabel + '  —  ' + esc(ev.city) + '</p>' +
+        transparency +
+        '<p class="evd-desc">' + esc(ev.description) + '</p>' +
+        '<div class="evd-actions">' +
+          '<button class="ev-like' + (ev.userLiked ? ' on' : '') + '" data-act="like">♥ <span class="n">' + ev.likes.toLocaleString() + '</span></button>' +
+          '<button class="ev-attend' + (ev.userAttending ? ' on' : '') + '" data-act="attend">✓ <span class="n">' + ev.attending.toLocaleString() + '</span></button>' +
+          '<button class="ev-save' + (P.isSaved(ev.id) ? ' on' : '') + '" data-act="save">' + (P.isSaved(ev.id) ? '★' : '☆') + '</button>' +
+        '</div>' + avail +
+      '</div>';
+    eventEl.classList.add('open');
+  }
+  function closeEvent() { eventEl.classList.remove('open'); activeEventId = null; }
+
+  eventEl.addEventListener('click', function (e) {
+    if (e.target.closest('.evd-x') || e.target.closest('.evd-back')) { closeEvent(); return; }
+    if (e.target.closest('[data-register]')) { window.EventuallyToast('Registration (demo) — native Eventually event.'); return; }
+    const srcBtn = e.target.closest('[data-src]');
+    if (srcBtn) {
+      const ev = D.getById(activeEventId);
+      const s = ev.sources.find(function (x) { return x.source_id === srcBtn.dataset.src; });
+      ev.clicks++; const n = M.trackAffiliate();
+      window.open(M.affiliate(s.url || 'https://example.com'), '_blank', 'noopener');
+      window.EventuallyToast('Opening ' + s.sourceLabel + ' — referral tracked (demo · ' + n + ').');
       updateStats(); return;
     }
-    if (act === 'save') {                          // personalization — saved events (anonymous ok)
-      const on = P.toggleSaved(ev.id);
-      btn.classList.toggle('on', on); btn.textContent = on ? '★' : '☆';
-      window.EventuallyToast(on ? 'Saved to your events.' : 'Removed from saved.');
-      return;
+    const act = e.target.closest('[data-act]'); if (!act) return;
+    const ev = D.getById(activeEventId);
+    if (act.dataset.act === 'save') {
+      const on = P.toggleSaved(ev.id); act.classList.toggle('on', on); act.textContent = on ? '★' : '☆';
+      window.EventuallyToast(on ? 'Saved to your events.' : 'Removed from saved.'); return;
     }
     requireLogin(function () {
-      if (act === 'like') {
+      if (act.dataset.act === 'like') {
         ev.userLiked = !ev.userLiked; ev.likes += ev.userLiked ? 1 : -1;
-        btn.classList.toggle('on', ev.userLiked);
-        btn.querySelector('.n').textContent = ev.likes.toLocaleString();
+        act.classList.toggle('on', ev.userLiked); act.querySelector('.n').textContent = ev.likes.toLocaleString();
         window.EventuallyToast(ev.userLiked ? 'Liked — the marker glows brighter.' : 'Like removed.');
       } else {
         ev.userAttending = !ev.userAttending; ev.attending += ev.userAttending ? 1 : -1;
         if (ev.userAttending) P.markAttended(ev.id);
-        btn.classList.toggle('on', ev.userAttending);
-        btn.querySelector('.n').textContent = ev.attending.toLocaleString();
+        act.classList.toggle('on', ev.userAttending); act.querySelector('.n').textContent = ev.attending.toLocaleString();
         window.EventuallyToast(ev.userAttending ? "You're attending — globe updated." : 'Removed from attending.');
       }
-      refreshMarkers();           // popularity changed -> marker brightness
+      refreshMarkers();
     });
   });
 
@@ -326,12 +382,11 @@
     searchResults.querySelectorAll('button').forEach(function (b) {
       b.addEventListener('click', function () {
         const ev = D.getById(b.dataset.id);
-        const c = D.getClusters().find(function (cl) { return cl.eventIds.indexOf(ev.id) > -1; });
         P.addSearch(searchInput.value);          // personalization — remember searches
         globe.flyTo(ev.lat, ev.lon);
         searchResults.classList.remove('show');
         searchInput.value = '';
-        if (c) setTimeout(function () { openPlace(c.id, ev.id); }, 600);
+        setTimeout(function () { openEvent(ev.id); }, 600);
       });
     });
   });
@@ -446,9 +501,8 @@
     const rec = e.target.closest('.pf-rec[data-id]');
     if (rec) {
       const ev = D.getById(rec.dataset.id);
-      const c = D.getClusters().find(function (cl) { return cl.eventIds.indexOf(ev.id) > -1; });
       profileEl.classList.remove('open'); globe.flyTo(ev.lat, ev.lon);
-      if (c) setTimeout(function () { openPlace(c.id, ev.id); }, 600);
+      setTimeout(function () { openEvent(ev.id); }, 600);
     }
   });
   profileEl.querySelector('.pf-plus-btn').addEventListener('click', function () {
