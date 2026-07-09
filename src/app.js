@@ -308,8 +308,71 @@
                lang: 'en-US', rtl: false };
     },
     // Admin-tunable delivery for the free browser voice (rate/pitch).
-    getVoiceSettings: function () { return RT.hostVoice || {}; }
+    getVoiceSettings: function () { return RT.hostVoice || {}; },
+    // Free "Today's briefing" (device voice): prefer the LLM-authored server
+    // script (local-first, worldwide fallback); if unavailable, build one locally
+    // from the loaded events so the feature always works.
+    getDailyBriefing: function () {
+      const loc = P.get().location;
+      const city = (loc && loc.city) ? loc.city : null;
+      const lang = P.get().language || 'en';
+      const localDay = new Date();
+      const day = localDay.getFullYear() + '-' +
+        String(localDay.getMonth() + 1).padStart(2, '0') + '-' +
+        String(localDay.getDate()).padStart(2, '0');
+      const fallback = function () { return { text: buildProceduralBriefing(city), lang: I18n.bcp(lang), rtl: I18n.isRTL(lang) }; };
+      if (!window.EventuallyAPI || !window.EventuallyAPI.config.remote || !window.EventuallyAPI.dailyBriefing) {
+        return Promise.resolve(fallback());
+      }
+      return window.EventuallyAPI.dailyBriefing({ city: city, lat: loc && loc.lat, lon: loc && loc.lon, lang: lang, day: day })
+        .then(function (b) { return (b && b.text) ? { text: b.text, lang: 'en-US' } : fallback(); })
+        .catch(fallback);
+    }
   });
+
+  // Compile a short spoken daily briefing locally from the loaded events — the
+  // free fallback when the LLM briefing isn't available. Local-first (events in
+  // the user's city), else worldwide top by popularity.
+  function buildProceduralBriefing(city) {
+    const h = new Date().getHours();
+    const part = h < 12 ? 'morning' : (h < 18 ? 'afternoon' : 'evening');
+    const all = D.getEvents().filter(function (e) {
+      const t = D.typeForDate(e, selectedDate); return t === 'live' || t === 'upcoming';
+    });
+    let pool = all;
+    if (city) {
+      const local = all.filter(function (e) { return e.city && e.city.toLowerCase() === city.toLowerCase(); });
+      if (local.length >= 2) pool = local;
+    }
+    pool = pool.slice().sort(function (a, b) { return D.popularity(b) - D.popularity(a); });
+    const place = (pool === all || !city) ? 'around the world' : city;
+    const name = P.get().name;
+    if (!pool.length) {
+      return 'Good ' + part + (name ? ', ' + name : '') + '. It\'s quiet on the globe right now — spin it to explore what\'s coming up near you.';
+    }
+    const top = pool.slice(0, 4);
+    const localCount = (pool !== all) ? pool.length : 0;
+    let s = 'Good ' + part + (name ? ', ' + name : '') + '. Here\'s your Eventually briefing for ' + place + '. ';
+    s += localCount ? ('There are ' + localCount + ' events coming up near you. ')
+                    : 'There\'s plenty happening around the world. ';
+    s += 'Top of the list: ' + top[0].name + ' in ' + top[0].city + '. ';
+    if (top[1]) s += 'Also worth a look, ' + top[1].name + (top[1].city ? ' in ' + top[1].city : '') + '. ';
+    if (top[2]) s += 'And keep an eye on ' + top[2].name + '. ';
+    s += 'Spin the globe to explore more.';
+    return s.replace(/\s{2,}/g, ' ').trim();
+  }
+
+  // Local event reminders (frontend). Reminds about SAVED events that are coming
+  // up, gated by the comms.reminders opt-in + Notification permission.
+  const Reminders = window.EventuallyReminders;
+  if (Reminders) {
+    Reminders.configure({
+      getById: function (id) { return D.getById(id); },
+      savedIds: function () { return P.get().saved || []; },
+      commsOn: function () { const c = P.get().comms; return !!(c && c.reminders); }
+    });
+  }
+  function syncReminders() { if (Reminders) Reminders.sync(); }
 
   /* ---------- coordinator portal ---------- */
   function addPublishedLocally(evt) {
@@ -648,6 +711,7 @@
     if (act.dataset.act === 'save') {
       const on = P.toggleSaved(ev.id); act.classList.toggle('on', on); act.textContent = on ? '★' : '☆';
       if (acctEnabled()) A.setUserEvent('save', ev.id, snap(ev), on);
+      syncReminders();
       window.EventuallyToast(on ? 'Saved to your events.' : 'Removed from saved.'); return;
     }
     requireLogin(function () {
@@ -799,26 +863,57 @@
       ? 'You\'re in ' + loc.city + ' — ' + near + ' event' + (near === 1 ? '' : 's') + ' within ' + NEAR_KM + ' km.'
       : 'Location set to ' + loc.city + ' — no events within ' + NEAR_KM + ' km yet.');
   }
+  // GPS → the REAL city name (reverse-geocoded), falling back to the nearest
+  // loaded-event city, then "Your area", if the geocoder is unavailable.
+  function setFromGPS(loc) {
+    const done = function (city) { setLocation({ city: city, lat: loc.lat, lon: loc.lon, source: 'gps' }); };
+    if (window.EventuallyGeo && window.EventuallyGeo.reverse) {
+      window.EventuallyGeo.reverse(loc.lat, loc.lon)
+        .then(function (r) { done((r && r.city) || (nearestCity(loc.lat, loc.lon) || {}).city || 'Your area'); })
+        .catch(function () { done((nearestCity(loc.lat, loc.lon) || {}).city || 'Your area'); });
+    } else { done((nearestCity(loc.lat, loc.lon) || {}).city || 'Your area'); }
+  }
   locChip.addEventListener('click', function (e) {
     e.stopPropagation();
-    let html = '<button class="loc-detect" data-detect="1">⌖ Use my current location</button><div class="loc-list">';
-    uniqueCities().forEach(function (c) {
-      html += '<button data-city="' + esc(c.city) + '" data-lat="' + c.lat + '" data-lon="' + c.lon + '">' + esc(c.city) + '</button>';
-    });
-    locMenu.innerHTML = html + '</div>';
-    locMenu.classList.toggle('show');
+    // Primary: current location. Fallback: type your city (any city, geocoded) —
+    // covers GPS denial / desktop, and lets any place be "home" (not just loaded ones).
+    locMenu.innerHTML =
+      '<button class="loc-detect" data-detect="1">⌖ Use my current location</button>' +
+      '<div class="loc-search"><input class="loc-input" type="text" placeholder="Or search your city…" autocomplete="off">' +
+      '<div class="loc-sug"></div></div>';
+    const open = !locMenu.classList.contains('show');
+    locMenu.classList.toggle('show', open);
+    if (open) { const inp = locMenu.querySelector('.loc-input'); if (inp) setTimeout(function () { inp.focus(); }, 30); }
   });
   locMenu.addEventListener('click', function (e) {
     if (e.target.closest('[data-detect]')) {
       window.EventuallyToast('Asking your browser for location…');
       P.detectLocation(function (loc) {
-        if (loc) { const c = nearestCity(loc.lat, loc.lon); setLocation({ city: c ? c.city : 'Your area', lat: loc.lat, lon: loc.lon, source: 'gps' }); }
-        else window.EventuallyToast('Location unavailable — pick a city below.');
+        if (loc) setFromGPS(loc);
+        else window.EventuallyToast('Location unavailable — search your city instead.');
       });
-      locMenu.classList.remove('show'); return;
+      const inp = locMenu.querySelector('.loc-input'); if (inp) setTimeout(function () { inp.focus(); }, 30);
+      return;
     }
-    const cb = e.target.closest('[data-city]');
-    if (cb) { setLocation({ city: cb.dataset.city, lat: +cb.dataset.lat, lon: +cb.dataset.lon, source: 'manual' }); locMenu.classList.remove('show'); }
+    const pick = e.target.closest('.loc-pick');
+    if (pick) { setLocation({ city: pick.dataset.city, lat: +pick.dataset.lat, lon: +pick.dataset.lon, source: 'manual' }); locMenu.classList.remove('show'); }
+  });
+  // Debounced city autocomplete (Nominatim) inside the location menu.
+  let _locTimer = null;
+  locMenu.addEventListener('input', function (e) {
+    if (!e.target.classList || !e.target.classList.contains('loc-input')) return;
+    const q = e.target.value.trim();
+    const sug = locMenu.querySelector('.loc-sug');
+    clearTimeout(_locTimer);
+    if (q.length < 3 || !window.EventuallyGeo) { if (sug) sug.innerHTML = ''; return; }
+    _locTimer = setTimeout(function () {
+      window.EventuallyGeo.search(q, 5).then(function (list) {
+        if (!sug) return;
+        sug.innerHTML = (list || []).map(function (r) {
+          return '<button class="loc-pick" data-city="' + esc(r.city) + '" data-lat="' + r.lat + '" data-lon="' + r.lon + '">' + esc(r.label) + '</button>';
+        }).join('');
+      });
+    }, 350);
   });
   document.addEventListener('click', function (e) { if (!e.target.closest('.loc-wrap')) locMenu.classList.remove('show'); });
   renderLocChip();
@@ -1066,6 +1161,14 @@
     if (comm) {
       const c = Object.assign({}, P.get().comms); const k = comm.dataset.comm;
       c[k] = !c[k]; P.set({ comms: c }); renderAccount(); syncProfile();
+      // Turning reminders on: ask for Notification permission (needs this gesture), then schedule.
+      if (k === 'reminders') {
+        if (c[k] && Reminders && !Reminders.permitted()) {
+          Reminders.requestPermission(function (ok) {
+            window.EventuallyToast(ok ? 'Reminders on — we\'ll ping you about saved events.' : 'Allow notifications to get reminders.');
+          });
+        } else { syncReminders(); }
+      }
       return;
     }
   });
@@ -1363,6 +1466,7 @@
         if (!pr) syncProfile();   // create/fill the profile row from local data
         if (A.myEvents) A.myEvents().then(function (rows) { myEventIds = (rows || []).map(function (r) { return r.event_id; }); markMine(); });
         renderMenuTrigger(); renderLocChip(); applyMonetization(); refreshMarkers(); refreshProfile();
+        syncReminders();                  // saved list changed after sign-in
         if (eventEl.classList.contains('open') && activeEventId) openEvent(activeEventId);
         if (place.classList.contains('open')) rerenderPlace();
         window.EventuallyToast('Signed in' + (user.name ? ' — welcome, ' + user.name + '.' : '.'));
@@ -1399,6 +1503,10 @@
         if (cfg.pinnedLocations) RT.pinned = cfg.pinnedLocations;
         if (cfg.hiddenCities) RT.hiddenCities = cfg.hiddenCities;
         if (cfg.hiddenEvents) RT.hiddenEvents = cfg.hiddenEvents;
+        // Admin can disable the free daily briefing → hide the "Today's briefing" button.
+        if (cfg.dailyBriefing && cfg.dailyBriefing.enabled === false) {
+          const bb = document.querySelector('.ah-briefing'); if (bb) bb.style.display = 'none';
+        }
         applyHidden();
         refreshMarkers(); applyMonetization();
       });
@@ -1415,6 +1523,7 @@
       rerenderPlace();
       if (timeline && timeline._drawSpark) timeline._drawSpark();
       setGlobeLoading(false);
+      syncReminders();                  // saved events are now resolvable → (re)schedule
     });
     window.EventuallyAPI.boot().then(function (ok) {
       if (!ok) {                      // load failed → fall back to demo data
