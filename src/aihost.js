@@ -5,6 +5,15 @@
 (function (global) {
   'use strict';
 
+  // Best-quality natural voices per platform, in priority order (name substrings).
+  const VOICE_PREF = [
+    'ava', 'samantha', 'allison', 'serena', 'zoe', 'nicky', 'evan',            // Apple
+    'aria', 'jenny', 'guy', 'michelle', 'sonia', 'libby', 'ryan',             // Microsoft
+    'google us english', 'google uk english female', 'google uk english male' // Google
+  ];
+  // Quality markers that boost any voice containing them.
+  const VOICE_BOOST = ['enhanced', 'premium', 'neural', 'natural', 'online', 'siri'];
+
   function AIHost(el, opts) {
     this.el = el;
     this.getLine = opts.getLine;          // () -> { text, kind, sponsor? }
@@ -12,6 +21,17 @@
     this.onPause = opts.onPause || function () {};
     this.onSpeakStart = opts.onSpeakStart || function () {};
     this.onSpeakEnd = opts.onSpeakEnd || function () {};
+    this.synth = opts.synth || null;       // (text, lang, kind) -> Promise<url|null> (legacy per-line)
+    this.getBriefing = opts.getBriefing || null;  // () -> Promise<{url,text}|null> (shared city briefing)
+    this.getOpener = opts.getOpener || null;      // () -> { text, lang, rtl } (personalized, browser voice)
+    this.getVoiceSettings = opts.getVoiceSettings || null;  // () -> { rate, pitch } (admin-tunable)
+    // Voices can load asynchronously; refresh the best-voice pick when they arrive.
+    if ('speechSynthesis' in global && global.speechSynthesis.addEventListener) {
+      const self = this;
+      global.speechSynthesis.addEventListener('voiceschanged', function () { self._voiceCache = {}; });
+    }
+    this._audio = new Audio();             // reusable element for premium-voice playback
+    this._audio.preload = 'auto'; this._audio.setAttribute('playsinline', '');
     this.speaking = false;
     this.amp = 0.14;
     this.bars = 40;
@@ -20,7 +40,7 @@
     this.current = null;
     this.INTRO = 10000;   // music alone before the Host first speaks (first play)
     this.SHORT_INTRO = 3000;  // shorter lead-in when resuming later
-    this.GAP = 10000;     // music between spoken segments (jittered for a live feel)
+    this.GAP = 30000;     // ~30s of music between spoken segments (jittered for a live feel)
     this.IDLE = 6500;     // silent caption ticker pace when not playing
     this._everPlayed = false;
     this._build();
@@ -51,57 +71,149 @@
     this.el.querySelector('.ah-play').addEventListener('click', function () { self.toggle(); });
   };
 
-  AIHost.prototype._rotate = function () {
-    if (!this.getLine) return;
-    const line = this.getLine();
-    if (!line) return;
+  // Update the caption (no audio). Shared by line rotation + briefing mode.
+  AIHost.prototype._showCaption = function (line) {
     this.current = line;
-    this._lang = line.lang || 'en-US';                 // BCP-47 for the utterance
     this.sponEl.style.display = line.kind === 'sponsor' ? '' : 'none';
     this.el.querySelector('.ah-caption').classList.toggle('is-sponsor', line.kind === 'sponsor');
     this.textEl.setAttribute('dir', line.rtl ? 'rtl' : 'ltr');   // Arabic etc.
-    // fade swap
     this.textEl.style.opacity = 0;
     const self = this;
     setTimeout(function () { self.textEl.textContent = line.text; self.textEl.style.opacity = 1; }, 180);
+  };
+
+  // After a spoken segment: swell music back, then leave a ~GAP before the next.
+  AIHost.prototype._afterSegment = function () {
+    clearInterval(this._ampTimer);
+    this.onSpeakEnd();
+    if (!this.speaking) return;
+    const self = this;
+    clearTimeout(this._gapTimer);
+    this._gapTimer = setTimeout(function () { if (self.speaking) self._rotate(); }, this._jitter(this.GAP, 2500));
+  };
+
+  AIHost.prototype._rotate = function () {
+    if (!this.getLine) return;
+    const self = this;
+    // Briefing mode (Plus): a personalized opener in the browser voice, then the
+    // SHARED, cached city briefing in the premium voice (cost-optimized "radio").
+    if (this.speaking && this.getBriefing) {
+      if (!this._openerDone) {
+        this._openerDone = true;
+        const op = this.getOpener ? this.getOpener() : null;
+        if (op && op.text) {
+          this._showCaption({ text: op.text, kind: 'greeting', lang: op.lang, rtl: op.rtl });
+          this._lang = op.lang || 'en-US';
+          this._browserSpeak(op.text, function () { if (self.speaking) self._rotate(); });
+          return;
+        }
+      }
+      this.getBriefing().then(function (b) {
+        if (!self.speaking) return;
+        if (b && b.url) {
+          self._showCaption({ text: b.text, kind: 'briefing', lang: 'en-US' });
+          self._audioSpeak(b.url, b.text, self._afterSegment.bind(self));
+        } else {
+          self._rotateLine();    // not Plus / unavailable → free browser rotation
+        }
+      }).catch(function () { self._rotateLine(); });
+      return;
+    }
+    this._rotateLine();
+  };
+
+  // Classic per-line rotation (free browser voice, or per-line synth if provided).
+  AIHost.prototype._rotateLine = function () {
+    const line = this.getLine();
+    if (!line) return;
+    this._lang = line.lang || 'en-US';                 // BCP-47 for the utterance
+    this._showCaption(line);
     if (this.speaking) this._speakAndContinue(line.text);
   };
 
-  // Speak one segment, then leave a ~GAP of music before advancing to the next.
+  // Speak one line, then a music GAP. Premium per-line synth if `synth` is set
+  // (legacy path), otherwise the free browser voice.
   AIHost.prototype._speakAndContinue = function (text) {
     const self = this;
-    function afterSegment() {
-      self.onSpeakEnd();                                   // swell music back up
-      if (!self.speaking) return;
-      clearTimeout(self._gapTimer);
-      self._gapTimer = setTimeout(function () { if (self.speaking) self._rotate(); }, self._jitter(self.GAP, 2500));
-    }
-    if ('speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(text);
-      u.rate = 1.0; u.pitch = 1.0; u.volume = 1.0;
-      u.lang = this._lang || 'en-US';
-      const v = this._voiceFor(u.lang); if (v) u.voice = v;
-      u.onstart = function () { self.amp = 0.6; self.onSpeakStart(); };   // duck music under voice
-      u.onboundary = function () { self.amp = 0.55 + Math.random() * 0.4; };
-      u.onend = afterSegment;
-      u.onerror = afterSegment;
-      self._utter = u;                       // keep a ref so the engine doesn't GC events
-      try { window.speechSynthesis.resume(); } catch (e) {}   // iOS can leave it paused
-      window.speechSynthesis.speak(u);
+    const afterSegment = this._afterSegment.bind(this);
+    const kind = this.current && this.current.kind;
+    if (this.synth) {
+      this.synth(text, this._lang, kind).then(function (url) {
+        if (url && self.speaking) self._audioSpeak(url, text, afterSegment);
+        else self._browserSpeak(text, afterSegment);
+      }).catch(function () { self._browserSpeak(text, afterSegment); });
     } else {
-      // no speech engine: simulate a read so the music rhythm still works
+      this._browserSpeak(text, afterSegment);
+    }
+  };
+
+  // Premium voice: play the returned audio URL via the (gesture-unlocked) element.
+  AIHost.prototype._audioSpeak = function (url, text, afterSegment) {
+    const self = this, a = this._audio;
+    try {
+      a.onended = function () { afterSegment(); };
+      a.onerror = function () { self._browserSpeak(text, afterSegment); };
+      a.src = url; a.currentTime = 0;
+      const p = a.play();
+      const begin = function () {
+        self.onSpeakStart();                               // duck music under voice
+        clearInterval(self._ampTimer);
+        self._ampTimer = setInterval(function () { self.amp = 0.5 + Math.random() * 0.4; }, 180);
+      };
+      if (p && p.then) p.then(begin).catch(function () { self._browserSpeak(text, afterSegment); });
+      else begin();
+    } catch (e) { self._browserSpeak(text, afterSegment); }
+  };
+
+  // Free voice: browser SpeechSynthesis (or a timed simulation if unavailable).
+  // Free voice: speak sentence-by-sentence with a natural pause between each (like
+  // a radio presenter), using the best available device voice + tuned rate/pitch.
+  AIHost.prototype._browserSpeak = function (text, afterSegment) {
+    const self = this;
+    if (!('speechSynthesis' in window)) {
       self.amp = 0.5;
       const read = Math.min(9000, 2600 + text.length * 45);
-      clearTimeout(self._readTimer);
-      self._readTimer = setTimeout(afterSegment, read);
+      clearTimeout(self._readTimer); self._readTimer = setTimeout(afterSegment, read);
+      return;
     }
+    window.speechSynthesis.cancel();
+    const sentences = self._splitSentences(text);
+    const voice = self._voiceFor(self._lang || 'en-US');
+    const cfg = self.getVoiceSettings ? (self.getVoiceSettings() || {}) : {};
+    const rate = cfg.rate || 0.98;                        // slightly relaxed = more natural
+    const pitch = (cfg.pitch != null ? cfg.pitch : 1.0);
+    self._utters = [];
+    let i = 0;
+    function next() {
+      if (!self.speaking) return;
+      if (i >= sentences.length) { afterSegment(); return; }
+      const u = new SpeechSynthesisUtterance(sentences[i]);
+      u.lang = self._lang || 'en-US'; u.rate = rate; u.pitch = pitch; u.volume = 1.0;
+      if (voice) u.voice = voice;
+      if (i === 0) u.onstart = function () { self.amp = 0.6; self.onSpeakStart(); };   // duck once
+      u.onboundary = function () { self.amp = 0.55 + Math.random() * 0.35; };
+      u.onend = function () { i++; next(); };             // gap between utterances = a natural breath
+      u.onerror = function () { i++; next(); };
+      self._utters.push(u);                                // GC guard
+      try { window.speechSynthesis.resume(); } catch (e) {}
+      window.speechSynthesis.speak(u);
+    }
+    next();
+  };
+
+  // Split into sentences so the engine pauses naturally between them.
+  AIHost.prototype._splitSentences = function (text) {
+    const t = String(text).replace(/\s+/g, ' ').trim();
+    const parts = t.match(/[^.!?…]+[.!?…]+["')\]]*(\s|$)|[^.!?…]+$/g);
+    const out = (parts || [t]).map(function (s) { return s.trim(); }).filter(Boolean);
+    return out.length ? out : [t];
   };
 
   AIHost.prototype.toggle = function () { this.speaking ? this.stop() : this.play(); };
 
   AIHost.prototype.play = function () {
     this.speaking = true;
+    this._openerDone = false;              // personalized opener plays once per session
     this.icPlay.style.display = 'none';
     this.icPause.style.display = '';
     this._unlockSpeech();                   // MUST run inside the tap to enable mobile TTS
@@ -119,25 +231,51 @@
     return Math.max(1500, base + (Math.random() * 2 - 1) * spread);
   };
 
-  // Pick a browser voice matching the language (free, on-device). Falls back to
-  // the engine default if no localized voice is installed on the device.
+  // Highest-quality device voice for a language, chosen automatically. Prefers the
+  // best known natural voices per platform (Apple Ava/Samantha, MS Aria/Jenny/Guy,
+  // Google), then any enhanced/premium/neural voice, then the locale default.
+  AIHost.prototype._scoreVoice = function (v) {
+    const n = (v.name || '').toLowerCase();
+    let s = 0;
+    for (let i = 0; i < VOICE_PREF.length; i++) { if (n.indexOf(VOICE_PREF[i]) > -1) { s += 60 - i; break; } }
+    for (let j = 0; j < VOICE_BOOST.length; j++) { if (n.indexOf(VOICE_BOOST[j]) > -1) s += 12; }
+    if (v.localService === false) s += 4;   // Chrome's Google network voices sound better than local eSpeak
+    if (v.default) s += 3;
+    return s;
+  };
   AIHost.prototype._voiceFor = function (bcp) {
     if (!('speechSynthesis' in window)) return null;
-    const pref = (bcp || 'en').slice(0, 2).toLowerCase();
+    const key = (bcp || 'en-US').toLowerCase();
+    this._voiceCache = this._voiceCache || {};
+    if (Object.prototype.hasOwnProperty.call(this._voiceCache, key)) return this._voiceCache[key];
     const vs = window.speechSynthesis.getVoices() || [];
-    let exact = null, lang = null;
-    for (let i = 0; i < vs.length; i++) {
-      const vl = (vs[i].lang || '').toLowerCase();
-      if (vl === (bcp || '').toLowerCase()) { exact = vs[i]; break; }
-      if (!lang && vl.slice(0, 2) === pref) lang = vs[i];
-    }
-    return exact || lang || null;
+    if (!vs.length) return null;                          // not loaded yet — retry on next line
+    const pref2 = key.slice(0, 2);
+    const matches = vs.filter(function (v) { return (v.lang || '').toLowerCase().slice(0, 2) === pref2; });
+    const pool = matches.length ? matches : vs;
+    const self = this;
+    let best = null, bestScore = -1;
+    pool.forEach(function (v) {
+      let sc = self._scoreVoice(v) + ((v.lang || '').toLowerCase() === key ? 5 : 0);   // exact-locale tiebreak
+      if (sc > bestScore) { bestScore = sc; best = v; }
+    });
+    this._voiceCache[key] = best;
+    return best;
   };
 
   // Mobile (esp. iOS Safari) only allows speech that begins inside a user gesture,
   // or after one has "unlocked" the engine. Our first real line is on a timer, so
   // we prime the engine here with a silent micro-utterance while still in the tap.
   AIHost.prototype._unlockSpeech = function () {
+    // Unlock the premium-voice <audio> element so it can play later off-gesture.
+    if (!this._audioUnlocked && this._audio) {
+      try {
+        this._audio.src = silentClip();
+        const p = this._audio.play();
+        if (p && p.then) p.then(function () {}).catch(function () {});
+        this._audioUnlocked = true;
+      } catch (e) {}
+    }
     if (this._unlocked || !('speechSynthesis' in window)) return;
     try {
       window.speechSynthesis.resume();
@@ -153,6 +291,8 @@
     this.icPlay.style.display = '';
     this.icPause.style.display = 'none';
     if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+    try { this._audio.pause(); } catch (e) {}
+    clearInterval(this._ampTimer);
     clearTimeout(this._introTimer); clearTimeout(this._gapTimer); clearTimeout(this._readTimer);
     this.onPause();                         // stop the music bed
     if (!this._timer) this._timer = setInterval(this._rotate.bind(this), this.IDLE);   // resume silent ticker
@@ -191,6 +331,22 @@
       ctx.fill();
     }
   };
+
+  // A tiny silent WAV (object URL) used once inside the play gesture to unlock the
+  // premium-voice <audio> element for later off-gesture playback on mobile.
+  let _silentUrl = null;
+  function silentClip() {
+    if (_silentUrl) return _silentUrl;
+    const sr = 8000, n = Math.floor(sr * 0.05);
+    const buf = new ArrayBuffer(44 + n * 2), dv = new DataView(buf);
+    const ws = function (o, s) { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
+    ws(0, 'RIFF'); dv.setUint32(4, 36 + n * 2, true); ws(8, 'WAVE'); ws(12, 'fmt ');
+    dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+    dv.setUint32(24, sr, true); dv.setUint32(28, sr * 2, true); dv.setUint16(32, 2, true);
+    dv.setUint16(34, 16, true); ws(36, 'data'); dv.setUint32(40, n * 2, true);
+    _silentUrl = URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+    return _silentUrl;
+  }
 
   function roundRect(ctx, x, y, w, h, r) {
     ctx.moveTo(x + r, y);

@@ -19,6 +19,7 @@
   <div id="stars"></div>
   <canvas id="globe" aria-label="Interactive 3D globe of world events"></canvas>
   <div id="hovertip"></div>
+  <div id="globe-loading"><span class="gl-dots"><i></i><i></i><i></i></span> Loading live events…</div>
 
   <!-- top bar -->
   <header class="topbar">
@@ -30,6 +31,10 @@
     <div class="search-wrap">
       <svg viewBox="0 0 24 24" class="search-ic"><path d="M21 21l-4.3-4.3M11 18a7 7 0 100-14 7 7 0 000 14z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
       <input id="search" placeholder="Search events, cities, categories…" autocomplete="off" />
+      <div class="types-wrap">
+        <button id="types-btn" class="types-btn" aria-label="Filter event types">Types <span class="types-badge" style="display:none"></span> <span class="types-caret">▾</span></button>
+        <div id="types-menu" class="types-menu"></div>
+      </div>
       <div id="search-results"></div>
     </div>
 
@@ -52,14 +57,6 @@
     </nav>
   </header>
 
-  <!-- legend -->
-  <div class="legend">
-    <div><i class="lg dot-up"></i> Location with upcoming events</div>
-    <div><i class="lg pillar"></i> Live today</div>
-    <div><i class="lg count"></i> Number = events at that spot</div>
-    <div class="legend-hint">Drag to spin · scroll to zoom · tap a marker to see all events</div>
-  </div>
-
   <!-- globe controls -->
   <div class="globe-controls">
     <button id="ctl-spin" class="ctl" title="Pause / resume spin" aria-label="Pause spin">
@@ -79,6 +76,7 @@
       </div>
       <button class="place-close" aria-label="Close">✕</button>
     </header>
+    <div class="place-tools"></div>
     <div class="place-list"></div>
   </aside>
 
@@ -98,14 +96,13 @@
       <p class="auth-sub">Browse anonymously anytime. Sign in to like, attend, and light up the globe.</p>
       <div class="sso">
         <button class="sso-btn" data-sso="google"><span>G</span> Continue with Google</button>
-        <button class="sso-btn" data-sso="apple"><span></span> Continue with Apple</button>
       </div>
       <div class="auth-or"><span>or</span></div>
       <form class="magic">
-        <input type="text" placeholder="Email or phone for a magic link" />
+        <input type="email" placeholder="you@email.com — get a magic link" />
         <button type="submit">Send magic link</button>
       </form>
-      <p class="auth-fine">Demo only — no real account is created.</p>
+      <p class="auth-fine">We'll email you a secure sign-in link. No password needed.</p>
     </div>
   </div>
 
@@ -128,6 +125,11 @@
       <section class="pf-sec">
         <div class="pf-row"><span class="pf-k">Location</span><span class="pf-loc">not set</span></div>
         <div class="pf-row"><span class="pf-k">Saved events</span><span><b class="pf-saved-n">0</b></span></div>
+      </section>
+
+      <section class="pf-sec pf-account">
+        <div class="pf-label">Account details</div>
+        <div class="pf-acct"></div>
       </section>
 
       <section class="pf-sec">
@@ -162,6 +164,12 @@
         <p class="pf-fine">Demo only — no payment is taken.</p>
       </section>
 
+      <section class="pf-sec pf-identities" style="display:none">
+        <div class="pf-label">Sign-in methods</div>
+        <div class="pf-id-list"></div>
+        <p class="pf-hint">Link Google and your email so they open the same account.</p>
+      </section>
+
       <button class="pf-logout" style="display:none">Sign out</button>
     </div>
   </aside>
@@ -183,9 +191,38 @@
 
   <div id="toast" class="toast"></div>
 
+  <!-- Backend config. Safe to commit: the anon key is a PUBLIC key, protected by
+       row-level security. Leave both blank to run on the built-in demo data.
+       (The Ticketmaster key is NEVER here — it lives only in Supabase Secrets.) -->
+  <script>
+    window.EVENTUALLY_CONFIG = {
+      supabaseUrl: 'https://gpsetmqivzchlvyrcgld.supabase.co',
+      supabaseAnonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imdwc2V0bXFpdnpjaGx2eXJjZ2xkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI1MDM2NzcsImV4cCI6MjA5ODA3OTY3N30.a0BB-FQDh5NKFvgxeSgJ3YmeN_HYOWGLOJza29wW8KI',
+      // Billing (Lemon Squeezy). Leave blank to keep the mock Plus toggle.
+      // Fill these in once your store + products exist (see backend/SETUP-BILLING.md).
+      billing: {
+        plusCheckoutUrl: '',      // Lemon Squeezy "Eventually Plus" subscription checkout URL
+        featureCheckoutUrl: '',   // one-off "Feature this event" product checkout URL
+        freeFeaturesPerMonth: 3   // hybrid: free features/month for Plus members
+      },
+      // AI Host premium voice (ElevenLabs, Plus-only). Set elevenlabs:true once the
+      // host-tts function + ELEVENLABS_API_KEY + voice ids are set up. Free tier
+      // (and everyone if false) keeps the on-device browser voice.
+      host: { elevenlabs: true }
+    };
+  </script>
+
+  <!-- Supabase JS (auth + user data). Falls back to anonymous mode if it can't load. -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
   <!-- scripts: classic (file:// friendly), dependency order -->
   <script src="src/dedup.js"></script>
   <script src="src/data.js"></script>
+  <script src="src/api.js"></script>
+  <script src="src/auth.js"></script>
+  <script src="src/billing.js"></script>
+  <script src="src/geo.js"></script>
+  <script src="src/hostvoice.js"></script>
   <script src="src/landdata.js"></script>
   <script src="src/profile.js"></script>
   <script src="src/monetize.js"></script>

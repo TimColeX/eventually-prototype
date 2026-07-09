@@ -17,11 +17,11 @@
   const LOCALE = { en: 'en-US', es: 'es-ES', fr: 'fr-FR', ar: 'ar-EG', zh: 'zh-CN' };
   const DEFAULT_NAME = { en: 'there', es: 'amigo', fr: 'cher visiteur', ar: 'صديقي', zh: '朋友' };
   const CAT = {
-    en: { Music: 'music', Tech: 'tech', Art: 'art', Food: 'food', Sports: 'sports', Film: 'film', Talks: 'talks' },
-    es: { Music: 'música', Tech: 'tecnología', Art: 'arte', Food: 'gastronomía', Sports: 'deportes', Film: 'cine', Talks: 'charlas' },
-    fr: { Music: 'musique', Tech: 'tech', Art: 'art', Food: 'gastronomie', Sports: 'sport', Film: 'cinéma', Talks: 'conférences' },
-    ar: { Music: 'موسيقى', Tech: 'تقنية', Art: 'فن', Food: 'طعام', Sports: 'رياضة', Film: 'أفلام', Talks: 'محادثات' },
-    zh: { Music: '音乐', Tech: '科技', Art: '艺术', Food: '美食', Sports: '体育', Film: '电影', Talks: '讲座' }
+    en: { 'Music': 'music', 'Tech': 'tech', 'Business': 'business', 'Arts': 'arts', 'Food & Drink': 'food & drink', 'Sports': 'sports', 'Film & Media': 'film & media', 'Community': 'community', 'Nightlife': 'nightlife', 'Comedy': 'comedy' },
+    es: { 'Music': 'música', 'Tech': 'tecnología', 'Business': 'negocios', 'Arts': 'arte', 'Food & Drink': 'gastronomía', 'Sports': 'deportes', 'Film & Media': 'cine y medios', 'Community': 'comunidad', 'Nightlife': 'vida nocturna', 'Comedy': 'comedia' },
+    fr: { 'Music': 'musique', 'Tech': 'tech', 'Business': 'affaires', 'Arts': 'art', 'Food & Drink': 'gastronomie', 'Sports': 'sport', 'Film & Media': 'cinéma et médias', 'Community': 'communauté', 'Nightlife': 'vie nocturne', 'Comedy': 'comédie' },
+    ar: { 'Music': 'موسيقى', 'Tech': 'تقنية', 'Business': 'أعمال', 'Arts': 'فنون', 'Food & Drink': 'طعام وشراب', 'Sports': 'رياضة', 'Film & Media': 'أفلام وإعلام', 'Community': 'مجتمع', 'Nightlife': 'حياة ليلية', 'Comedy': 'كوميديا' },
+    zh: { 'Music': '音乐', 'Tech': '科技', 'Business': '商业', 'Arts': '艺术', 'Food & Drink': '美食', 'Sports': '体育', 'Film & Media': '影视', 'Community': '社区', 'Nightlife': '夜生活', 'Comedy': '喜剧' }
   };
   const GREET = {
     en: { morning: 'Good morning', afternoon: 'Good afternoon', evening: 'Good evening' },
@@ -36,16 +36,16 @@
 
   const T = {
     en: {
-      welcome: d => `Welcome to Eventually. There are currently ${n(d.count, 'en')} live events happening worldwide.`,
+      welcome: d => `Welcome to Eventually! Right now, there are ${n(d.count, 'en')} events happening live around the world.`,
       greeting: d => d.hasRecs
-        ? `${GREET.en[d.part]}, ${nm(d, 'en')}. Based on your interests, I found ${d.k} live ${c('en', d.cat)} events within ${d.mi} miles, including ${d.event} in ${d.city}.`
-        : `${GREET.en[d.part]}, ${nm(d, 'en')}. Set your location and interests and I'll line up events made for you.`,
-      spotlight: d => `Spinning the spotlight onto ${d.event} in ${d.city} — ${n(d.going, 'en')} people are going right now.`,
-      countdown: d => `${d.event} kicks off in ${d.min} minutes in ${d.city}.`,
-      region: d => `${d.n} major ${c('en', d.cat)} events are currently underway in ${d.region}.`,
-      trending: d => `Trending right now: ${d.event} in ${d.city}, with ${n(d.likes, 'en')} likes.`,
+        ? `${GREET.en[d.part]}, ${nm(d, 'en')}! Based on what you love, I've found ${d.k} live ${c('en', d.cat)} events within ${d.mi} miles — including ${d.event}, over in ${d.city}.`
+        : `${GREET.en[d.part]}, ${nm(d, 'en')}! Set your location and a few interests, and I'll line up events made just for you.`,
+      spotlight: d => `Here's one to watch: ${d.event}, in ${d.city}. ${n(d.going, 'en')} people are heading there right now.`,
+      countdown: d => `Heads up — ${d.event} in ${d.city} kicks off in just ${d.min} minutes.`,
+      region: d => `Over in ${d.region}, ${d.n} big ${c('en', d.cat)} events are underway right now.`,
+      trending: d => `Trending tonight: ${d.event}, in ${d.city}. It's climbing fast, with ${n(d.likes, 'en')} likes.`,
       sponsor: d => `This update is brought to you by ${d.sponsor}.`,
-      tip: () => `Tap any glowing marker to see everything happening there.`
+      tip: () => `Tap any glowing marker on the globe, and you'll see everything happening there.`
     },
     es: {
       welcome: d => `Bienvenido a Eventually. Ahora mismo hay ${n(d.count, 'es')} eventos en directo en todo el mundo.`,

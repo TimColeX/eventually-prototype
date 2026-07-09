@@ -58,10 +58,7 @@
     }
 
     const voices = [
-      // News anchor — the worldwide pulse
-      // News anchor — worldwide pulse
-      function () { return { kind: 'welcome', data: { count: worldwideLive() } }; },
-      // Concierge — personalized greeting (localized name/category downstream)
+      // Concierge — LEAD with the user's area (geolocation/chosen city); prompt if unknown
       function () {
         const p = ctx.profile.get();
         const interests = ctx.profile.effectiveInterests(ctx.data.getById);
@@ -76,6 +73,8 @@
         }
         return { kind: 'greeting', data: { part: partOfDay(), name: p.name || null, hasRecs: false } };
       },
+      // News anchor — the worldwide pulse
+      function () { return { kind: 'welcome', data: { count: worldwideLive() } }; },
       // Radio DJ — spotlight
       function () {
         const live = liveEvents().sort(function (a, b) { return ctx.data.popularity(b) - ctx.data.popularity(a); });
@@ -114,6 +113,7 @@
     ];
 
     return {
+      reset: function () { i = 0; sinceSponsor = 0; },   // so the Host leads with the location greeting
       // Emits a STRUCTURED line: { kind, data, sponsor? }. The i18n layer renders text.
       next: function () {
         sinceSponsor++;

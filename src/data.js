@@ -5,12 +5,15 @@
 (function (global) {
   'use strict';
 
-  // "Today" for the demo. Matches the session date so Live/Upcoming make sense.
-  const TODAY = new Date('2026-06-22T12:00:00Z');
+  // "Today" = the user's LOCAL current day (local noon). All day math below uses
+  // local calendar components so the timeline/markers match the date on the
+  // user's own device — not UTC. (noon avoids DST edge wobble.)
+  const _now = new Date();
+  const TODAY = new Date(_now.getFullYear(), _now.getMonth(), _now.getDate(), 12, 0, 0, 0);
 
   function dayOffset(n) {
     const d = new Date(TODAY);
-    d.setUTCDate(d.getUTCDate() + n);
+    d.setDate(d.getDate() + n);
     return d;
   }
 
@@ -23,15 +26,22 @@
   };
 
   // Warm "Clay" palette tints — every marker stays in the brand family.
+  // Order here = order in the Types dropdown / globe filter.
   const CATEGORIES = {
-    Music:  '#CB5A3C',  // Clay
-    Tech:   '#8A3B1E',  // Ember
-    Art:    '#E0875F',  // Apricot
-    Food:   '#B5722F',  // Ochre
-    Sports: '#A23A22',  // Clay-red
-    Film:   '#6E4A30',  // Cocoa
-    Talks:  '#C18A5C'   // Tan
+    'Music':         '#CB5A3C',  // Clay
+    'Tech':          '#8A3B1E',  // Ember
+    'Business':      '#6E4A30',  // Cocoa
+    'Arts':          '#E0875F',  // Apricot
+    'Food & Drink':  '#B5722F',  // Ochre
+    'Sports':        '#A23A22',  // Clay-red
+    'Film & Media':  '#7C5230',  // Bronze
+    'Community':     '#C18A5C',  // Tan
+    'Nightlife':     '#9B4A52',  // Warm brick-rose
+    'Comedy':        '#E8A24C'   // Warm amber
   };
+
+  // Old category names in the hand-written seed list map onto the new set.
+  const CAT_ALIAS = { Art: 'Arts', Food: 'Food & Drink', Film: 'Film & Media', Talks: 'Business' };
 
   // Seed cities with real-ish coordinates so the globe reads as a real map.
   const RAW = [
@@ -99,7 +109,8 @@
 
   let _id = 0;
   const EVENTS = RAW.map(function (r) {
-    const [name, city, lat, lon, off, category, source, banner] = r;
+    const [name, city, lat, lon, off, rawCat, source, banner] = r;
+    const category = CAT_ALIAS[rawCat] || rawCat;
     const date = dayOffset(off);
     const baseLikes = 40 + Math.floor(Math.random() * 900);
     // deterministic pseudo "starts in N minutes" so the Host can do countdowns
@@ -136,7 +147,10 @@
   /* ---- Multi-source feed + live deduplication ---------------------------------
    * Each event becomes one or more raw SOURCE records (the same event can appear
    * across platforms). The dedup engine clusters them back together at load.     */
-  const PRICE_BY_CAT = { Music: 35, Tech: 25, Sports: 40, Art: 15, Food: 10, Film: 18, Talks: 0 };
+  const PRICE_BY_CAT = {
+    'Music': 35, 'Tech': 25, 'Business': 30, 'Arts': 15, 'Food & Drink': 10,
+    'Sports': 40, 'Film & Media': 18, 'Community': 0, 'Nightlife': 20, 'Comedy': 22
+  };
   const PLATFORM_URL = {
     eventbrite: function (id) { return 'https://www.eventbrite.com/e/' + id; },
     meetup: function (id) { return 'https://www.meetup.com/events/' + id; },
@@ -202,13 +216,107 @@
     merged: SOURCE_RECORDS.length - DEDUP.groups.length, comparisons: DEDUP.comparisons
   };
 
+  /* ---- Simulated scale: tens of thousands of events worldwide --------------
+   * The curated seed events above stay rich (with real dedup). These generated
+   * events let the globe demonstrate the "living planet" visualization at scale.
+   * They cluster geographically like everything else. Bump SIM_TARGET to stress-test. */
+  const SIM_TARGET = 9000;
+  const CITY_SEED = [
+    ['Tokyo',35.68,139.69],['Osaka',34.69,135.50],['Seoul',37.57,126.98],['Beijing',39.90,116.40],
+    ['Shanghai',31.23,121.47],['Hong Kong',22.32,114.17],['Bangkok',13.75,100.50],['Singapore',1.35,103.82],
+    ['Jakarta',-6.21,106.85],['Manila',14.60,120.98],['Mumbai',19.08,72.88],['Delhi',28.61,77.21],
+    ['Bengaluru',12.97,77.59],['Dubai',25.20,55.27],['Istanbul',41.01,28.98],['Tel Aviv',32.08,34.78],
+    ['Sydney',-33.86,151.21],['Melbourne',-37.81,144.96],['Auckland',-36.85,174.76],
+    ['London',51.50,-0.12],['Paris',48.85,2.35],['Berlin',52.52,13.40],['Madrid',40.42,-3.70],
+    ['Barcelona',41.39,2.17],['Rome',41.90,12.50],['Amsterdam',52.37,4.90],['Lisbon',38.72,-9.14],
+    ['Stockholm',59.33,18.06],['Oslo',59.91,10.75],['Copenhagen',55.68,12.57],['Dublin',53.35,-6.26],
+    ['Vienna',48.21,16.37],['Prague',50.08,14.44],['Warsaw',52.23,21.01],['Athens',37.98,23.73],
+    ['Zurich',47.37,8.54],['Moscow',55.76,37.62],
+    ['New York',40.71,-74.01],['Los Angeles',34.05,-118.24],['Chicago',41.88,-87.63],['Toronto',43.65,-79.38],
+    ['Montreal',45.50,-73.57],['Vancouver',49.28,-123.12],['San Francisco',37.77,-122.42],['Seattle',47.61,-122.33],
+    ['Austin',30.27,-97.74],['Miami',25.76,-80.19],['Boston',42.36,-71.06],['Mexico City',19.43,-99.13],
+    ['Denver',39.74,-104.99],['Atlanta',33.75,-84.39],['Las Vegas',36.17,-115.14],
+    ['São Paulo',-23.55,-46.63],['Rio de Janeiro',-22.91,-43.17],['Buenos Aires',-34.60,-58.38],
+    ['Bogotá',4.71,-74.07],['Lima',-12.05,-77.04],['Santiago',-33.45,-70.67],
+    ['Cairo',30.04,31.24],['Lagos',6.52,3.37],['Nairobi',-1.29,36.82],['Cape Town',-33.92,18.42],
+    ['Johannesburg',-26.20,28.05],['Accra',5.60,-0.19],['Casablanca',33.57,-7.59],['Marrakesh',31.63,-7.99],
+    ['Addis Ababa',9.03,38.74],['Dakar',14.72,-17.47]
+  ];
+  const CATS = Object.keys(CATEGORIES);
+  const SIM_PLATFORMS = ['ticketmaster', 'eventbrite', 'meetup'];
+  function rnd(a, b) { return a + Math.random() * (b - a); }
+  function pickOne(a) { return a[(Math.random() * a.length) | 0]; }
+  (function generate() {
+    const perCity = Math.ceil(SIM_TARGET / CITY_SEED.length);
+    CITY_SEED.forEach(function (c) {
+      const count = Math.max(8, Math.round(perCity * rnd(0.4, 1.7)));
+      for (let i = 0; i < count; i++) {
+        const cat = pickOne(CATS);
+        // date mix: ~16% live today, ~26% within a week, rest spread out
+        const r = Math.random();   // forward-only window: today (live) .. +60 days
+        const off = r < 0.16 ? 0 : (r < 0.42 ? (1 + (Math.random() * 6 | 0)) : (1 + (Math.random() * 59 | 0)));
+        const date = dayOffset(off);
+        const likes = 10 + (Math.random() * Math.random() * 4000 | 0);   // skewed: a few very popular
+        const sponsored = Math.random() < 0.04;
+        const editor = Math.random() < 0.05;
+        const src = pickOne(SIM_PLATFORMS);
+        const price = cat === 'Community' ? 0 : (5 + (Math.random() * 12 | 0) * 5);
+        const id = 'evt_' + (++_id);
+        const col = CATEGORIES[cat];
+        EVENTS.push({
+          id: id, name: cat + ' · ' + c[0] + ' #' + (i + 1), city: c[0],
+          lat: c[1] + rnd(-0.06, 0.06), lon: c[2] + rnd(-0.06, 0.06),
+          date: date, dayOffset: off, category: cat, categoryColor: col,
+          source: src, sourceLabel: SOURCES[src].label, sourceColor: SOURCES[src].color,
+          banner: [col, '#211A15'],
+          description: 'A ' + cat.toLowerCase() + ' event in ' + c[0] + ', aggregated onto Eventually.',
+          ticketUrl: 'https://example.com/e/' + id,
+          likes: likes, attending: (likes * rnd(0.3, 0.7)) | 0, clicks: likes * 3,
+          sponsored: sponsored, editor: editor, startsInMin: 8 + (Math.random() * 175 | 0),
+          userLiked: false, userAttending: false,
+          sources: [{
+            source_id: 'src_' + id, source: src, sourceLabel: SOURCES[src].label, badge: SOURCES[src].badge,
+            url: 'https://example.com/e/' + id, price: price, priceLabel: price === 0 ? 'Free' : '$' + price,
+            organizer: c[0] + ' ' + cat, last_updated: Date.now(), title: cat + ' · ' + c[0],
+            city: c[0], lat: c[1], lon: c[2], startMs: date.getTime(), description: '', category: cat, _evid: id
+          }],
+          sourceCount: 1, is_native: false, topScore: 1, cheapestId: null, displaySource: src
+        });
+      }
+    });
+  })();
+
+  // Capture only ACTIVE/UPCOMING events in the forward window (today .. +60 days).
+  // No past, no far-future — matches the API scraping rule we'll enforce server-side.
+  const WINDOW_DAYS = 60;
+  (function () {
+    const keep = EVENTS.filter(function (e) { return e.dayOffset >= 0 && e.dayOffset <= WINDOW_DAYS; });
+    EVENTS.length = 0; Array.prototype.push.apply(EVENTS, keep);
+  })();
+
+  // O(1) id lookup — essential now that EVENTS holds thousands of records.
+  const BYID = {};
+  EVENTS.forEach(function (e) { BYID[e.id] = e; });
+
+  // Guard against events with missing / garbage coordinates. Exact (0,0) is
+  // "Null Island" (open ocean in the Gulf of Guinea) — never a real venue, and
+  // the classic symptom of a missing lat/lon that got stored as zero. Filtering
+  // it here (the single chokepoint every live/search/native event passes through)
+  // keeps such rows off the globe no matter which source produced them.
+  function hasValidCoord(e) {
+    return e && Number.isFinite(e.lat) && Number.isFinite(e.lon)
+      && Math.abs(e.lat) <= 90 && Math.abs(e.lon) <= 180
+      && !(e.lat === 0 && e.lon === 0);
+  }
+
   function typeForDate(evt, selectedDate) {
     // Same calendar day as selected date => LIVE (pillar). Future => UPCOMING (dot).
+    // Local calendar components so "today" matches the user's device date.
     const a = evt.date, b = selectedDate;
     const sameDay =
-      a.getUTCFullYear() === b.getUTCFullYear() &&
-      a.getUTCMonth() === b.getUTCMonth() &&
-      a.getUTCDate() === b.getUTCDate();
+      a.getFullYear() === b.getFullYear() &&
+      a.getMonth() === b.getMonth() &&
+      a.getDate() === b.getDate();
     if (sameDay) return 'live';
     return a.getTime() > b.getTime() ? 'upcoming' : 'past';
   }
@@ -231,28 +339,25 @@
   let _loc = 0;
   let CLUSTERS = [];
 
+  // Grid-bucket clustering (~0.3° ≈ 33km cells) — O(n), so it scales to 50k+.
+  const CELL = 0.3;
   function buildClusters() {
-    _loc = 0;
-    CLUSTERS = [];
+    _loc = 0; CLUSTERS = [];
+    const cells = {};
     EVENTS.forEach(function (ev) {
-      let found = null;
-      for (let i = 0; i < CLUSTERS.length; i++) {
-        if (haversineKm(CLUSTERS[i].lat, CLUSTERS[i].lon, ev.lat, ev.lon) < 30) { found = CLUSTERS[i]; break; }
-      }
-      if (found) {
-        found.eventIds.push(ev.id);
-        const n = found.eventIds.length;            // running centroid
-        found.lat += (ev.lat - found.lat) / n;
-        found.lon += (ev.lon - found.lon) / n;
-      } else {
-        CLUSTERS.push({ id: 'loc_' + (++_loc), lat: ev.lat, lon: ev.lon, city: ev.city, eventIds: [ev.id] });
-      }
+      const key = Math.round(ev.lat / CELL) + '_' + Math.round(ev.lon / CELL);
+      let c = cells[key];
+      if (!c) { c = cells[key] = { id: 'loc_' + (++_loc), lat: ev.lat, lon: ev.lon, city: ev.city, eventIds: [], _n: 0 }; CLUSTERS.push(c); }
+      c.eventIds.push(ev.id);
+      c._n++;
+      c.lat += (ev.lat - c.lat) / c._n;             // running centroid
+      c.lon += (ev.lon - c.lon) / c._n;
     });
     return CLUSTERS;
   }
   buildClusters();
 
-  function byId(id) { return EVENTS.find(function (e) { return e.id === id; }); }
+  function byId(id) { return BYID[id]; }
 
   global.EventuallyData = {
     TODAY: TODAY,
@@ -266,11 +371,32 @@
     getClusters: function () { return CLUSTERS; },
     buildClusters: buildClusters,
     getSourceStats: function () { return SOURCE_STATS; },
+    // Swap the entire dataset for a live (API) one, then rebuild id-index + clusters.
+    // Used by EventuallyAPI when a backend is configured (stale-while-revalidate).
+    replaceAll: function (newEvents) {
+      if (!newEvents || !newEvents.length) return EVENTS;
+      newEvents = newEvents.filter(hasValidCoord);
+      EVENTS.length = 0;
+      Array.prototype.push.apply(EVENTS, newEvents);
+      for (const k in BYID) { if (Object.prototype.hasOwnProperty.call(BYID, k)) delete BYID[k]; }
+      EVENTS.forEach(function (e) { BYID[e.id] = e; });
+      buildClusters();
+      return EVENTS;
+    },
+    // Add events not already loaded (from a search/area fetch), then re-cluster.
+    // Used so searching a city off the loaded globe brings its events onto the map.
+    mergeEvents: function (newEvents) {
+      if (!newEvents || !newEvents.length) return EVENTS;
+      let added = 0;
+      newEvents.forEach(function (e) { if (hasValidCoord(e) && !BYID[e.id]) { EVENTS.push(e); BYID[e.id] = e; added++; } });
+      if (added) buildClusters();
+      return EVENTS;
+    },
     addEvent: function (evt) {
-      evt.id = 'evt_' + (++_id);
+      if (!evt.id) evt.id = 'evt_' + (++_id);   // keep a pre-assigned id (DB native event)
       // a coordinator-published event is native, single-source
       evt.sources = [{
-        source_id: 'src_native_' + _id, source: 'native', sourceLabel: 'Eventually', badge: '',
+        source_id: 'src_native_' + evt.id, source: 'native', sourceLabel: 'Eventually', badge: '',
         url: evt.ticketUrl || null, price: null, priceLabel: 'Register',
         organizer: 'Eventually', last_updated: Date.now(),
         title: evt.name, city: evt.city, lat: evt.lat, lon: evt.lon,
@@ -279,6 +405,7 @@
       evt.sourceCount = 1; evt.is_native = true; evt.topScore = 1;
       evt.displaySource = 'native'; evt.cheapestId = null;
       EVENTS.push(evt);
+      BYID[evt.id] = evt;
       buildClusters();
       return evt;
     }

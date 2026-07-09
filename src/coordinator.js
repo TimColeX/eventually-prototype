@@ -22,22 +22,42 @@
     return false;
   }
 
+  // Geocoding is the shared EventuallyGeo util (OpenStreetMap Nominatim).
+  const Geo = global.EventuallyGeo;
+
   function Coordinator(el, opts) {
     this.el = el;
-    this.onPublish = opts.onPublish;       // (eventObj) -> void
+    this.onPublish = opts.onPublish;       // (eventObj) -> Promise<bool>
+    this.onUpdate = opts.onUpdate;         // (eventObj) -> Promise<bool>  (edit existing)
+    this.onDelete = opts.onDelete;         // (eventId) -> Promise<bool>
+    this.onSetPublished = opts.onSetPublished; // (eventId, bool) -> Promise
+    this.getCreatorStats = opts.getCreatorStats; // () -> Promise<[{event_id,title,...,saves,likes,attends,published}]>
+    this.getDefaultLocation = opts.getDefaultLocation; // () -> {lat,lon,city}|null (user's set location)
     this.onFlyTo = opts.onFlyTo;           // (lat, lon) -> void
-    this.getMyEvents = opts.getMyEvents;   // () -> [events]
+    this.getMyEvents = opts.getMyEvents;   // () -> [events]  (demo fallback)
     this.pin = { lat: 48.85, lon: 2.35 };  // default Paris
     this.banner = ['#CB5A3C', '#8A3B1E'];
+    this.city = null;                       // resolved place name (geocoded)
+    this.editId = null;                     // set when editing an existing event
+    this.locationChosen = false;            // a real location must be picked before publishing
     this._build();
   }
 
   Coordinator.prototype.open = function () {
     this.el.classList.add('open');
+    if (!this.editId && !this.locationChosen) this._applyDefaultLocation();   // start on the user's location
     this._drawMap();
     this._renderAnalytics();
   };
   Coordinator.prototype.close = function () { this.el.classList.remove('open'); };
+
+  // Pre-fill the pin with the user's set location (counts as "chosen"). Otherwise
+  // leave the neutral default and require an explicit pick before publishing.
+  Coordinator.prototype._applyDefaultLocation = function () {
+    const d = this.getDefaultLocation && this.getDefaultLocation();
+    if (d && d.lat != null) { this.pin = { lat: d.lat, lon: d.lon }; this.city = d.city || null; this.locationChosen = true; }
+    else { this.locationChosen = false; }
+  };
 
   Coordinator.prototype._build = function () {
     const self = this;
@@ -50,33 +70,40 @@
         '</header>' +
         '<div class="co-grid">' +
           '<section class="co-card co-form">' +
+            '<div class="co-card-h co-form-h">Publish a new event</div>' +
             '<label>Event name<input class="f-name" placeholder="Midnight Rooftop Sessions"></label>' +
             '<label>Category' +
               '<select class="f-cat">' + Object.keys(global.EventuallyData.CATEGORIES)
                 .map(function (c) { return '<option>' + c + '</option>'; }).join('') +
               '</select></label>' +
-            '<label>Date<input type="date" class="f-date" value="2026-06-25"></label>' +
+            '<label>Date<input type="date" class="f-date"></label>' +
             '<label>Description<textarea class="f-desc" rows="3" placeholder="Tell people what to expect…"></textarea></label>' +
             '<label>Ticket / source link<input class="f-url" placeholder="https://yourtickets.com/show"></label>' +
             '<div class="f-banner">' +
               '<span>Event banner</span>' +
               '<div class="swatches"></div>' +
             '</div>' +
+            '<label class="co-feature"><input type="checkbox" class="f-feature">' +
+              '<span class="co-feature-txt"><b>✦ Feature this event</b>' +
+              '<small>Premium placement — distinct highlight, a spike, and top of search. Billed via Eventually Plus.</small></span>' +
+            '</label>' +
             '<button class="co-publish">Publish event ✦</button>' +
-            '<p class="co-note">Demo mode — events appear instantly on the live globe.</p>' +
+            '<button class="co-cancel-edit" type="button" style="display:none">Cancel edit</button>' +
+            '<p class="co-note">Your event is geo-located and published live to the globe.</p>' +
           '</section>' +
 
           '<section class="co-card co-map">' +
             '<div class="co-card-h">Geolocation · drop a pin</div>' +
             '<canvas class="map-canvas"></canvas>' +
             '<div class="co-coords">' +
-              '<input class="f-addr" placeholder="Search address or city…">' +
+              '<div class="co-search"><input class="f-addr" placeholder="Search address or city…" autocomplete="off"><div class="co-suggest"></div></div>' +
               '<div class="latlon">lat <strong class="ll-lat"></strong> · lon <strong class="ll-lon"></strong></div>' +
+            '<div class="co-place">📍 <strong class="ll-city">—</strong></div>' +
             '</div>' +
           '</section>' +
 
           '<section class="co-card co-analytics">' +
-            '<div class="co-card-h">Your engagement</div>' +
+            '<div class="co-card-h">My events &amp; engagement</div>' +
             '<div class="an-body"></div>' +
           '</section>' +
         '</div>' +
@@ -98,6 +125,13 @@
       sw.appendChild(b);
     });
 
+    // Default the date to today; allow today .. +60 days (the forward window).
+    const dateEl = this.el.querySelector('.f-date');
+    const t = global.EventuallyData.TODAY;
+    const fmt = function (d) { return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); };
+    const maxD = new Date(t); maxD.setDate(maxD.getDate() + 60);
+    dateEl.value = fmt(t); dateEl.min = fmt(t); dateEl.max = fmt(maxD);
+
     this.el.querySelector('.co-close').addEventListener('click', function () { self.close(); });
     this.mapCanvas = this.el.querySelector('.map-canvas');
     this.mapCanvas.addEventListener('click', function (e) {
@@ -106,53 +140,160 @@
       const y = (e.clientY - r.top) / r.height;
       self.pin.lon = x * 360 - 180;
       self.pin.lat = 90 - y * 180;
+      self.city = null;
+      self.locationChosen = true;           // dropping a pin counts as choosing a location
+      var m0 = self.el.querySelector('.co-map'); if (m0) m0.classList.remove('co-need-loc');
       self._drawMap();
+      // name the dropped pin (best-effort reverse geocode)
+      const at = { lat: self.pin.lat, lon: self.pin.lon };
+      if (Geo) Geo.reverse(at.lat, at.lon).then(function (res) {
+        if (res && self.pin.lat === at.lat && self.pin.lon === at.lon) { self.city = res.city; self._drawMap(); }
+      }).catch(function () {});
     });
 
-    // Fake geocode: type a known city name -> coordinates.
-    const GEO = { paris:[48.85,2.35], london:[51.5,-0.12], tokyo:[35.68,139.69],
-      'new york':[40.71,-74.0], lagos:[6.52,3.37], sydney:[-33.86,151.21],
-      berlin:[52.52,13.4], nairobi:[-1.29,36.82], 'são paulo':[-23.55,-46.63],
-      mumbai:[19.08,72.88], dubai:[25.2,55.27], toronto:[43.65,-79.38] };
-    this.el.querySelector('.f-addr').addEventListener('keydown', function (e) {
-      if (e.key !== 'Enter') return;
-      const q = e.target.value.trim().toLowerCase();
-      if (GEO[q]) { self.pin.lat = GEO[q][0]; self.pin.lon = GEO[q][1]; self._drawMap(); }
-      else self._toast('Try: Paris, London, Tokyo, Lagos, Sydney…');
+    // Address autocomplete: type-ahead suggestions; pick one to drop the pin
+    // (still adjustable by clicking the map). Enter picks the top suggestion.
+    const addr = this.el.querySelector('.f-addr');
+    const suggest = this.el.querySelector('.co-suggest');
+    let acTimer = null, acResults = [];
+    function hideSuggest() { suggest.classList.remove('show'); suggest.innerHTML = ''; acResults = []; }
+    function pick(res) {
+      self.pin.lat = res.lat; self.pin.lon = res.lon; self.city = res.city;
+      self.locationChosen = true;           // picking a searched address counts
+      var m1 = self.el.querySelector('.co-map'); if (m1) m1.classList.remove('co-need-loc');
+      addr.value = res.city || (res.label || '').split(',')[0];
+      hideSuggest(); self._drawMap();
+      self._toast('📍 ' + (res.city || 'Location set'));
+    }
+    function renderSuggest() {
+      if (!acResults.length) { hideSuggest(); return; }
+      suggest.innerHTML = acResults.map(function (r, i) {
+        return '<button type="button" class="co-sug" data-i="' + i + '">📍 ' + esc(r.label || r.city) + '</button>';
+      }).join('');
+      suggest.classList.add('show');
+    }
+    addr.addEventListener('input', function () {
+      const q = addr.value.trim();
+      clearTimeout(acTimer);
+      if (q.length < 3 || !Geo) { hideSuggest(); return; }
+      acTimer = setTimeout(function () {
+        Geo.search(q, 5).then(function (rs) { acResults = rs || []; renderSuggest(); }).catch(hideSuggest);
+      }, 350);   // debounce (respects Nominatim fair-use)
     });
+    addr.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); if (acResults[0]) pick(acResults[0]); }
+      else if (e.key === 'Escape') hideSuggest();
+    });
+    suggest.addEventListener('click', function (e) {
+      const b = e.target.closest('[data-i]'); if (!b) return;
+      const r = acResults[+b.dataset.i]; if (r) pick(r);
+    });
+    document.addEventListener('click', function (e) { if (!e.target.closest('.co-search')) hideSuggest(); });
+
+    function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (m) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[m]; }); }
 
     this.el.querySelector('.co-publish').addEventListener('click', function () {
       self._publish();
     });
+    this.el.querySelector('.co-cancel-edit').addEventListener('click', function () { self._resetForm(); });
+
+    // My-events list actions (edit / publish-toggle / delete)
+    this.el.querySelector('.an-body').addEventListener('click', function (e) {
+      const b = e.target.closest('[data-me-act]'); if (!b) return;
+      const id = b.dataset.id, act = b.dataset.meAct;
+      const ev = (self._myEvents || []).find(function (x) { return x.event_id === id; });
+      if (act === 'edit') { if (ev) self._editEvent(ev); }
+      else if (act === 'toggle') { if (self.onSetPublished) Promise.resolve(self.onSetPublished(id, !(ev && ev.published !== false))).then(function () { self._renderAnalytics(); }); }
+      else if (act === 'delete') {
+        if (!confirm('Delete "' + (ev ? ev.title : 'this event') + '" permanently? This cannot be undone.')) return;
+        if (self.onDelete) Promise.resolve(self.onDelete(id)).then(function () { if (self.editId === id) self._resetForm(); self._renderAnalytics(); });
+      }
+    });
   };
 
   Coordinator.prototype._publish = function () {
+    const self = this;
     const q = function (s) { return this.el.querySelector(s); }.bind(this);
     const name = q('.f-name').value.trim();
     if (!name) { this._toast('Add an event name first.'); return; }
+    if (!this.locationChosen) {
+      this._toast('Set a location first — search an address or tap the map.');
+      const map = this.el.querySelector('.co-map'); if (map) { map.classList.add('co-need-loc'); q('.f-addr').focus(); }
+      return;
+    }
     const cat = q('.f-cat').value;
     const dateStr = q('.f-date').value;
-    const date = new Date(dateStr + 'T19:00:00Z');
-    const url = q('.f-url').value.trim();
+    if (!dateStr) { this._toast('Pick a date.'); return; }
+    const date = new Date(dateStr + 'T19:00:00');   // local 7pm
     const today = global.EventuallyData.TODAY;
     const dayOffset = Math.round((date - today) / 86400000);
+    if (dayOffset < 0) { this._toast('Pick a date from today onward.'); return; }
+    if (dayOffset > 60) { this._toast('Events can be up to 60 days ahead.'); return; }
+    const url = q('.f-url').value.trim();
+    const editing = !!this.editId;
+    const id = this.editId || ('nat_' + (global.crypto && crypto.randomUUID ? crypto.randomUUID()
+      : (Date.now() + '_' + Math.random().toString(36).slice(2))));
 
     const evt = {
-      name: name, city: 'Your pin', lat: this.pin.lat, lon: this.pin.lon,
+      id: id, name: name, city: this.city || 'Dropped pin', lat: this.pin.lat, lon: this.pin.lon,
       date: date, dayOffset: dayOffset, category: cat,
       categoryColor: global.EventuallyData.CATEGORIES[cat],
-      source: 'orbit', sourceLabel: 'Eventually Native', sourceColor: '#21d4fd',
+      source: 'orbit', sourceLabel: 'Eventually Native', sourceColor: '#CB5A3C',
       banner: this.banner.slice(),
       description: q('.f-desc').value.trim() || (name + ' — published via the Eventually Coordinator portal.'),
       ticketUrl: url || null,
+      sponsored: !!q('.f-feature').checked,    // paid "Feature" placement
       likes: 0, attending: 0, clicks: 0, userLiked: false, userAttending: false,
       _mine: true
     };
-    this.onPublish(evt);
-    this._toast('Published! ' + name + ' is now live on the globe.');
-    if (this.onFlyTo) this.onFlyTo(evt.lat, evt.lon);
+    const btn = this.el.querySelector('.co-publish');
+    btn.disabled = true; btn.textContent = editing ? 'Saving…' : 'Publishing…';
+    const action = editing && this.onUpdate ? this.onUpdate(evt) : this.onPublish(evt);
+    Promise.resolve(action).then(function (res) {
+      const r = (res && typeof res === 'object') ? res : { ok: !!res, live: true };
+      btn.disabled = false;
+      if (!r.ok) { btn.textContent = editing ? 'Update event' : 'Publish event ✦'; return; }
+      self._toast(r.message || (editing ? 'Changes saved.' : 'Published!'));
+      if (r.live && self.onFlyTo) self.onFlyTo(evt.lat, evt.lon);   // only fly if it's actually on the globe
+      self._resetForm();
+      self._renderAnalytics();
+    }).catch(function () {
+      btn.disabled = false; btn.textContent = editing ? 'Update event' : 'Publish event ✦';
+      self._toast((editing ? 'Save' : 'Publish') + ' failed — please try again.');
+    });
+  };
+
+  // Reset the form to "create" mode.
+  Coordinator.prototype._resetForm = function () {
+    const q = function (s) { return this.el.querySelector(s); }.bind(this);
+    this.editId = null; this.city = null;
     q('.f-name').value = ''; q('.f-desc').value = ''; q('.f-url').value = '';
-    this._renderAnalytics();
+    if (q('.f-feature')) q('.f-feature').checked = false;
+    q('.co-publish').textContent = 'Publish event ✦';
+    const h = this.el.querySelector('.co-form-h'); if (h) h.textContent = 'Publish a new event';
+    const cancel = this.el.querySelector('.co-cancel-edit'); if (cancel) cancel.style.display = 'none';
+    q('.f-addr').value = '';
+    const map = this.el.querySelector('.co-map'); if (map) map.classList.remove('co-need-loc');
+    this._applyDefaultLocation();            // start fresh on the user's location (if set)
+    this._drawMap();
+  };
+
+  // Load an event into the form for editing.
+  Coordinator.prototype._editEvent = function (ev) {
+    const q = function (s) { return this.el.querySelector(s); }.bind(this);
+    this.editId = ev.event_id;
+    this.locationChosen = true;              // an existing event already has a location
+    q('.f-name').value = ev.title || '';
+    q('.f-cat').value = ev.category || q('.f-cat').value;
+    if (ev.start_time) { const d = new Date(ev.start_time); q('.f-date').value = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
+    q('.f-desc').value = ev.description || '';
+    q('.f-url').value = ev.url || '';
+    this.pin = { lat: +ev.lat, lon: +ev.lon }; this.city = ev.city || null;
+    q('.co-publish').textContent = 'Update event';
+    const h = this.el.querySelector('.co-form-h'); if (h) h.textContent = 'Editing: ' + (ev.title || 'event');
+    const cancel = this.el.querySelector('.co-cancel-edit'); if (cancel) cancel.style.display = '';
+    this._drawMap();
+    this.el.querySelector('.co-shell').scrollTop = 0;
   };
 
   Coordinator.prototype._drawMap = function () {
@@ -187,38 +328,58 @@
 
     this.el.querySelector('.ll-lat').textContent = this.pin.lat.toFixed(2);
     this.el.querySelector('.ll-lon').textContent = this.pin.lon.toFixed(2);
+    const cityEl = this.el.querySelector('.ll-city');
+    if (cityEl) cityEl.textContent = this.city || '—';
   };
 
   Coordinator.prototype._renderAnalytics = function () {
-    const mine = (this.getMyEvents && this.getMyEvents()) || [];
-    const body = this.el.querySelector('.an-body');
-    if (!mine.length) {
-      body.innerHTML = '<p class="an-empty">No events yet. Publish one to see live likes, clicks and attendees here.</p>';
-      return;
+    const self = this, body = this.el.querySelector('.an-body');
+    function esc(s) { return String(s == null ? '' : s).replace(/[&<>]/g, function (m) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[m]; }); }
+    function draw(rows, real) {
+      self._myEvents = rows;
+      if (!rows.length) {
+        body.innerHTML = '<p class="an-empty">' + (real === false
+          ? 'Sign in to publish and manage your events here.'
+          : 'No events yet. Publish one to see it here with likes, saves and attendees.') + '</p>';
+        return;
+      }
+      const sum = function (k) { return rows.reduce(function (a, e) { return a + (+e[k] || 0); }, 0); };
+      let html = '<div class="an-kpis">' +
+        kpi('Saves', sum('saves'), '#CB5A3C') + kpi('Likes', sum('likes'), '#8A3B1E') + kpi('Attending', sum('attends'), '#B5722F') +
+        '</div><div class="an-list">';
+      rows.forEach(function (e) {
+        const pub = e.published !== false;
+        const mod = e.moderation || 'approved';
+        let status = '';
+        if (mod === 'pending') status = ' <span class="an-badge an-pending">⏳ pending review</span>';
+        else if (mod === 'rejected') status = ' <span class="an-badge an-rejected">✕ rejected</span>';
+        else if (!pub) status = ' <span class="an-badge">unpublished</span>';
+        const reason = (mod === 'rejected' && e.moderation_reason) ? '<small class="an-reason">Reason: ' + esc(e.moderation_reason) + '</small>' : '';
+        html += '<div class="an-row2">' +
+          '<div class="an-r-main"><strong>' + esc(e.title) + '</strong>' + status + reason +
+          '<small>' + esc(e.city || '') + ' · ★ ' + (+e.saves || 0) + ' · ♥ ' + (+e.likes || 0) + ' · ✓ ' + (+e.attends || 0) + ' going</small></div>' +
+          '<div class="an-r-actions">' +
+            '<button class="an-act" data-me-act="edit" data-id="' + esc(e.event_id) + '">Edit</button>' +
+            '<button class="an-act" data-me-act="toggle" data-id="' + esc(e.event_id) + '">' + (pub ? 'Unpublish' : 'Publish') + '</button>' +
+            '<button class="an-act an-danger" data-me-act="delete" data-id="' + esc(e.event_id) + '">Delete</button>' +
+          '</div></div>';
+      });
+      body.innerHTML = html + '</div>';
     }
-    const totL = mine.reduce(function (a, e) { return a + e.likes; }, 0);
-    const totA = mine.reduce(function (a, e) { return a + e.attending; }, 0);
-    const totC = mine.reduce(function (a, e) { return a + e.clicks; }, 0);
-    let html =
-      '<div class="an-kpis">' +
-        kpi('Likes', totL, '#CB5A3C') + kpi('Attending', totA, '#8A3B1E') +
-        kpi('Link clicks', totC, '#B5722F') +
-      '</div><div class="an-list">';
-    const max = Math.max.apply(null, mine.map(function (e) { return e.likes + e.attending + 1; }));
-    mine.forEach(function (e) {
-      const v = (e.likes + e.attending) / max * 100;
-      html += '<div class="an-row"><span>' + esc(e.name) + '</span>' +
-        '<div class="an-bar"><i style="width:' + v + '%"></i></div>' +
-        '<small>' + e.likes + '♥ · ' + e.attending + ' going</small></div>';
-    });
-    html += '</div>';
-    body.innerHTML = html;
+    function kpi(label, val, col) { return '<div class="kpi"><strong style="color:' + col + '">' + (val || 0).toLocaleString() + '</strong><span>' + label + '</span></div>'; }
 
-    function kpi(label, val, col) {
-      return '<div class="kpi"><strong style="color:' + col + '">' + val.toLocaleString() +
-        '</strong><span>' + label + '</span></div>';
+    body.innerHTML = '<p class="an-empty">Loading your events…</p>';
+    if (this.getCreatorStats) {
+      this.getCreatorStats().then(function (rows) {
+        if (rows && rows.length) return draw(rows, true);
+        // no backend rows → demo fallback (local _mine events)
+        const mine = (self.getMyEvents && self.getMyEvents()) || [];
+        draw(mine.map(function (e) { return { event_id: e.id, title: e.name, city: e.city, published: true, saves: 0, likes: e.likes, attends: e.attending, start_time: e.date && e.date.toISOString(), description: e.description, category: e.category, lat: e.lat, lon: e.lon, url: e.ticketUrl }; }), false);
+      }).catch(function () { draw([], false); });
+    } else {
+      const mine = (this.getMyEvents && this.getMyEvents()) || [];
+      draw(mine.map(function (e) { return { event_id: e.id, title: e.name, city: e.city, published: true, saves: 0, likes: e.likes, attends: e.attending }; }), true);
     }
-    function esc(s) { return s.replace(/[&<>]/g, function (m) { return ({'&':'&amp;','<':'&lt;','>':'&gt;'})[m]; }); }
   };
 
   Coordinator.prototype._toast = function (msg) {
