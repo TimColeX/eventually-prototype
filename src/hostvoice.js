@@ -34,20 +34,66 @@
 
   global.EventuallyHostVoice = {
     enabled: ENABLED,
-    // Shared, cached city briefing (the cost-optimized path).
-    // -> Promise<{url, text}|null>
-    getBriefing: function (city, lang) {
+    // Premium briefing from the UNIFIED provider (rich Claude script → ElevenLabs,
+    // keyed by cluster cell; audio:true → Plus audio segments). Returns normalized
+    // { segments:[{url,text}], text } (body + any verbatim promo clips), or null.
+    // opts: {city,lat,lon,lang,day}
+    getBriefing: function (opts) {
+      if (!ENABLED) return Promise.resolve(null);
+      const o = opts || {};
+      return accessToken().then(function (tk) {
+        if (!tk) return null;
+        return fetch(BASE + '/functions/v1/briefing', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'apikey': ANON, 'Authorization': 'Bearer ' + tk },
+          body: JSON.stringify({
+            audio: true, city: o.city || null,
+            lat: (o.lat != null ? o.lat : null), lon: (o.lon != null ? o.lon : null),
+            lang: (o.lang || 'en').slice(0, 2), day: o.day || null,
+            interests: o.interests || [], saved: o.saved || 0    // personalized concierge tails
+          })
+        }).then(function (r) {
+          if (!r.ok) { r.json().then(function (e) { console.warn('[HostVoice] briefing ' + r.status, e); }).catch(function () {}); return null; }
+          return r.json();
+        }).then(function (j) {
+          if (!j) return null;
+          if (j.segments && j.segments.length) return { segments: j.segments, text: j.text || j.segments[0].text || '' };
+          if (j.url) return { segments: [{ url: j.url, text: j.text || '' }], text: j.text || '' };   // legacy single-url
+          return null;
+        });
+      }).catch(function () { return null; });
+    },
+    // FREE tier intro: cached ElevenLabs clips reused by ALL free users → near-zero
+    // marginal cost. Assembled [count]+[upsell] on the first play (`full`), else a
+    // short welcome-back. No login needed. opts: {part,lang,count,full}
+    // -> Promise<{segments:[{url,text}]}|null>
+    getFreeGreeting: function (opts) {
+      if (!ENABLED) return Promise.resolve(null);
+      var o = opts || {};
+      return fetch(BASE + '/functions/v1/briefing', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'apikey': ANON, 'Authorization': 'Bearer ' + ANON },
+        body: JSON.stringify({ greeting: true, part: o.part || 'day', lang: (o.lang || 'en').slice(0, 2), count: o.count || 0, full: !!o.full })
+      }).then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (j) {
+          if (j && j.segments && j.segments.length) return { segments: j.segments };
+          if (j && j.url) return { segments: [{ url: j.url, text: j.text || '' }] };   // legacy single
+          return null;
+        }).catch(function () { return null; });
+    },
+    // Short, generic, cached ElevenLabs intro clip — played instantly at the start of
+    // a Plus show while the full briefing synthesizes (keeps Premium all-ElevenLabs).
+    // -> Promise<{url,text}|null>
+    getStinger: function (lang) {
       if (!ENABLED) return Promise.resolve(null);
       return accessToken().then(function (tk) {
         if (!tk) return null;
-        return fetch(BASE + '/functions/v1/host-briefing', {
+        return fetch(BASE + '/functions/v1/briefing', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'apikey': ANON, 'Authorization': 'Bearer ' + tk },
-          body: JSON.stringify({ city: city || null, lang: (lang || 'en').slice(0, 2) })
-        }).then(function (r) {
-          if (!r.ok) { r.json().then(function (e) { console.warn('[HostVoice] host-briefing ' + r.status, e); }).catch(function () {}); return null; }
-          return r.json();
-        }).then(function (j) { return (j && j.url) ? { url: j.url, text: j.text || '' } : null; });
+          body: JSON.stringify({ stinger: true, lang: (lang || 'en').slice(0, 2) })
+        }).then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (j) { return (j && j.url) ? { url: j.url, text: j.text || '' } : null; });
       }).catch(function () { return null; });
     },
     // -> Promise<string|null> (audio URL, or null to use the browser voice)

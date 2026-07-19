@@ -58,6 +58,7 @@
     main.innerHTML =
       '<div class="ad-tabs">' +
         tabBtn('overview', 'Overview') + tabBtn('review', 'Review Events') +
+        tabBtn('subs', 'Subscriptions') +
         tabBtn('host', 'AI Host Script') + tabBtn('browser', 'Browser Voice') +
         tabBtn('globe', 'Globe & Display') +
       '</div><div id="ad-body"></div>';
@@ -67,6 +68,7 @@
     const body = document.getElementById('ad-body');
     if (tab === 'overview') renderOverview(body);
     else if (tab === 'review') renderReview(body);
+    else if (tab === 'subs') renderSubscriptions(body);
     else if (tab === 'host') renderHost(body);
     else if (tab === 'browser') renderBrowser(body);
     else renderGlobe(body);
@@ -141,9 +143,119 @@
         return '<div class="ad-li"><span>' + esc(c.city) + '</span><span>' + c.n + '</span></div>';
       }).join('') + '</div>';
       html += '</div>';
+      html += '<div class="ad-sec" id="ad-src"><h2>Event sources</h2><p class="ad-hint">Counting per source…</p></div>';
       html += '<div class="ad-sec" id="ad-dq"><h2>Data quality</h2><p class="ad-hint">Checking event coordinates…</p></div>';
+      html += '<div class="ad-sec" id="ad-bu"><h2>Daily briefing usage</h2><p class="ad-hint">Counting Claude calls…</p></div>';
+      html += '<div class="ad-sec" id="ad-el"><h2>ElevenLabs usage (Plus voice)</h2><p class="ad-hint">Measuring cache performance…</p></div>';
       body.innerHTML = html;
+      renderSourceBreakdown();
       renderDataQuality();
+      renderBriefingUsage();
+      renderAudioUsage();
+    });
+  }
+
+  // ElevenLabs cache performance + spend, by category. Proves the caching is working:
+  // a high hit % means we rarely pay ElevenLabs. Chars ≈ credits for eleven_multilingual_v2.
+  const EL_COST_PER_1K = 0.30;   // ≈ $ per 1,000 characters (adjust to your ElevenLabs plan)
+  function renderAudioUsage() {
+    const box = document.getElementById('ad-el');
+    if (!box) return;
+    sb.rpc('admin_audio_usage', { p_days: 30 }).then(function (r) {
+      const d = r.data;
+      if (!d || (r.error && r.error.message)) {
+        box.innerHTML = '<h2>ElevenLabs usage (Plus voice)</h2><p class="ad-hint">Unavailable (' +
+          esc((r.error && r.error.message) || 'run backend/32_audio_usage.sql') + ').</p>';
+        return;
+      }
+      const money = function (chars) { const v = (chars / 1000) * EL_COST_PER_1K; return '≈ $' + v.toFixed(v < 1 ? 3 : 2); };
+      const kpi = function (v, l) { return '<div class="ad-kpi"><b>' + v + '</b><span>' + l + '</span></div>'; };
+      const perUser = d.plus_users ? Math.round(d.chars / d.plus_users) : 0;
+      const cats = d.by_category || {};
+      let catRows = Object.keys(cats).map(function (k) {
+        var c = cats[k];
+        return '<div class="ad-li"><span><b>' + esc(k) + '</b></span><span>' + (c.requests || 0) + ' req · ' +
+          (c.misses || 0) + ' synth · ' + (c.chars || 0).toLocaleString() + ' chars</span></div>';
+      }).join('') || '<div class="ad-li"><span class="ad-hint">No requests yet.</span></div>';
+      var reused = (d.top_reused || []).map(function (t) {
+        return '<div class="ad-li"><span>' + esc(t.scope || '—') + '</span><span>' + t.hits + ' reuse</span></div>';
+      }).join('') || '<div class="ad-li"><span class="ad-hint">—</span></div>';
+      box.innerHTML = '<h2>ElevenLabs usage (Plus voice) · last ' + (d.window_days || 30) + ' days</h2>' +
+        '<p class="ad-hint">Each request either hits the cache (no ElevenLabs call) or synthesizes. A high hit % = the caching is preventing spend. Characters ≈ ElevenLabs credits; edit EL_COST_PER_1K in admin.js for your plan.</p>' +
+        '<div class="ad-grid">' +
+          kpi((d.hit_pct != null ? d.hit_pct : 0) + '%', 'Cache hit rate') +
+          kpi((d.misses || 0).toLocaleString(), 'ElevenLabs calls (synths)') +
+          kpi((d.hits || 0).toLocaleString(), 'Cache hits (free)') +
+          kpi((d.chars || 0).toLocaleString(), 'Chars synthesized') +
+          kpi(money(d.chars || 0), 'Est. spend') +
+          kpi((d.chars_saved || 0).toLocaleString(), 'Chars saved by cache') +
+          kpi((d.plus_users || 0), 'Plus listeners') +
+          kpi(perUser.toLocaleString(), 'Chars / listener') +
+        '</div>' +
+        '<div class="ad-field" style="margin-top:14px"><label>By category</label><div class="ad-list">' + catRows + '</div></div>' +
+        '<div class="ad-field" style="margin-top:10px"><label>Most reused (cache hits by area)</label><div class="ad-list">' + reused + '</div></div>';
+    }).catch(function () { box.innerHTML = '<h2>ElevenLabs usage (Plus voice)</h2><p class="ad-hint">Unavailable.</p>'; });
+  }
+
+  // Per-source breakdown (live). Dynamic — any new source appears automatically.
+  const SRC_LABELS = { ticketmaster: 'Ticketmaster', predicthq: 'PredictHQ', native: 'Eventually', meetup: 'Meetup', eventbrite: 'Eventbrite', seatgeek: 'SeatGeek' };
+  function renderSourceBreakdown() {
+    const box = document.getElementById('ad-src');
+    if (!box) return;
+    sb.rpc('admin_source_breakdown').then(function (r) {
+      const d = r.data;
+      if (!d || (r.error && r.error.message)) {
+        box.innerHTML = '<h2>Event sources</h2><p class="ad-hint">Unavailable (' +
+          esc((r.error && r.error.message) || 'run backend/27_source_breakdown.sql') + ').</p>';
+        return;
+      }
+      const srcs = d.sources || [];
+      const max = Math.max.apply(null, srcs.map(function (s) { return s.share || 0; }).concat([1]));
+      const nm = function (k) { return SRC_LABELS[k] || (k ? k.charAt(0).toUpperCase() + k.slice(1) : '—'); };
+      let h = '<h2>Event sources</h2>' +
+        '<p class="ad-hint">Where the ' + (d.total_events || 0).toLocaleString() + ' events on the globe come from. ' +
+        '“events” counts each event once (its primary source); “listings” counts every source an event appears on. New sources appear here automatically.</p>' +
+        '<div class="ad-bars">' + srcs.map(function (s) {
+          return '<div class="ad-bar"><span>' + esc(nm(s.source)) + '</span>' +
+            '<i style="width:' + ((s.share || 0) / max * 100) + '%"></i>' +
+            '<span>' + (s.primary_events || 0).toLocaleString() + ' events · ' +
+            (s.listings || 0).toLocaleString() + ' listings · ' + (s.share || 0) + '%</span></div>';
+        }).join('') + '</div>' +
+        '<div class="ad-grid" style="margin-top:12px">' +
+          '<div class="ad-kpi"><b>' + (d.multi_source || 0).toLocaleString() + '</b><span>On 2+ sources</span></div>' +
+        '</div>';
+      box.innerHTML = h;
+    }).catch(function () { box.innerHTML = '<h2>Event sources</h2><p class="ad-hint">Unavailable.</p>'; });
+  }
+
+  // Daily-briefing spend at a glance: each daily_briefings row = one Claude call
+  // (one cluster cell generated that day, shared by everyone there). Cost is an
+  // estimate for Claude Haiku 4.5 at ~150 words per briefing.
+  const BRIEFING_COST_PER_CALL = 0.0015;   // ≈ $ (Haiku 4.5: ~500 in + ~180 out tokens)
+  function renderBriefingUsage() {
+    const box = document.getElementById('ad-bu');
+    if (!box) return;
+    const today = todayStr();
+    const wa = new Date(); wa.setDate(wa.getDate() - 6);
+    const weekAgo = wa.getFullYear() + '-' + String(wa.getMonth() + 1).padStart(2, '0') + '-' + String(wa.getDate()).padStart(2, '0');
+    const cnt = function (q) { return q.then(function (r) { return (r && r.count) || 0; }); };
+    Promise.all([
+      cnt(sb.from('daily_briefings').select('scope', { count: 'exact', head: true }).eq('day', today)),
+      cnt(sb.from('daily_briefings').select('scope', { count: 'exact', head: true }).gte('day', weekAgo)),
+      cnt(sb.from('daily_briefings').select('scope', { count: 'exact', head: true }))
+    ]).then(function (res) {
+      const tday = res[0], wk = res[1], total = res[2];
+      const money = function (n) { const v = n * BRIEFING_COST_PER_CALL; return '≈ $' + v.toFixed(v < 1 ? 3 : 2); };
+      const kpi = function (v, l) { return '<div class="ad-kpi"><b>' + v + '</b><span>' + l + '</span></div>'; };
+      box.innerHTML = '<h2>Daily briefing usage</h2>' +
+        '<p class="ad-hint">Each Claude call generates one briefing for a cluster cell that day, shared by everyone there — so this is the whole free-briefing spend. Cost is estimated for Claude Haiku 4.5 (~150-word briefings); check your Anthropic Console for exact billing.</p>' +
+        '<div class="ad-grid">' +
+        kpi(tday, 'Claude calls · today') + kpi(money(tday), 'Est. cost · today') +
+        kpi(wk, 'Calls · last 7 days') + kpi(money(wk), 'Est. cost · 7 days') +
+        kpi(total, 'Cached briefings (total)') +
+        '</div>';
+    }).catch(function () {
+      box.innerHTML = '<h2>Daily briefing usage</h2><p class="ad-hint">Unavailable (run backend/21_daily_briefing.sql).</p>';
     });
   }
 
@@ -183,76 +295,28 @@
   }
 
   /* ---------------- AI Host Script ---------------- */
-  let scripts = [];   // host_script rows
-  let dbCfg = {};     // app_config.config.dailyBriefing
-  let dbRows = [];    // recent daily_briefings (cache view)
+  let dbCfg = {};      // app_config.config.dailyBriefing
+  let dbRows = [];     // recent daily_briefings (cache view)
+  let dbSponsors = []; // briefing_sponsors rows
   function renderHost(body) {
     body.innerHTML = '<div class="ad-center">Loading script…</div>';
     Promise.all([
-      sb.from('host_script').select('*').order('scope'),
       sb.from('app_config').select('config').eq('id', 1).maybeSingle(),
-      sb.from('daily_briefings').select('scope,day,text,generated_at').order('generated_at', { ascending: false }).limit(20)
+      sb.from('daily_briefings').select('scope,day,text,generated_at').order('generated_at', { ascending: false }).limit(20),
+      sb.from('briefing_sponsors').select('*').order('scope')
     ]).then(function (res) {
-      scripts = res[0].data || [];
-      dbCfg = (res[1].data && res[1].data.config && res[1].data.config.dailyBriefing) || {};
-      dbRows = res[2].data || [];
-      drawHost(body, 'global');
+      dbCfg = (res[0].data && res[0].data.config && res[0].data.config.dailyBriefing) || {};
+      dbRows = res[1].data || [];
+      dbSponsors = (res[2] && res[2].data) || [];
+      drawHost(body);
     });
   }
-  function findScope(scope) { return scripts.find(function (s) { return s.scope === scope; }) || { scope: scope, template: '', announcement: '', sponsor_message: '', enabled: true }; }
-
-  function drawHost(body, scope) {
-    const opts = [{ scope: 'global' }].concat(scripts.filter(function (s) { return s.scope !== 'global'; }))
-      .map(function (s) { return '<option value="' + esc(s.scope) + '"' + (s.scope === scope ? ' selected' : '') + '>' + (s.scope === 'global' ? 'Global (default)' : esc(s.scope)) + '</option>'; }).join('');
-    const cur = findScope(scope);
-    body.innerHTML =
-      '<div class="ad-sec"><h2>AI Host script</h2>' +
-      '<p class="ad-hint">Edit what the Host says. The city briefing uses this template; a city/region override replaces the global one for that place. Changes apply on the next ~20-min refresh window.</p>' +
-      '<div class="ad-row"><div class="ad-field"><label>Scope</label><select id="hs-scope">' + opts + '</select></div>' +
-      '<div class="ad-field"><label>Add city/region override (lowercase, e.g. toronto)</label>' +
-      '<div style="display:flex;gap:8px"><input id="hs-new" placeholder="city name…"><button class="ad-save" id="hs-add" type="button">Add</button></div></div></div>' +
-      '<div class="ad-field"><label>Template</label><textarea id="hs-tmpl">' + esc(cur.template) + '</textarea>' +
-      '<div class="ad-chips">' + ['{city}', '{count}', '{top}', '{featured}'].map(function (t) { return '<span class="ad-chip" data-ins="' + t + '">' + t + '</span>'; }).join('') + '</div></div>' +
-      '<div class="ad-field"><label>Announcement (optional — appended)</label><textarea id="hs-ann">' + esc(cur.announcement) + '</textarea></div>' +
-      '<div class="ad-field"><label>Sponsor message (optional — appended)</label><textarea id="hs-spon">' + esc(cur.sponsor_message) + '</textarea></div>' +
-      '<label class="ad-toggle"><input type="checkbox" id="hs-en"' + (cur.enabled === false ? '' : ' checked') + '> Enabled</label>' +
-      '<div><button class="ad-save" id="hs-save">Save script</button><span class="ad-saved" id="hs-msg"></span></div>' +
-      '<div class="ad-field" style="margin-top:16px"><label>Live preview (sample data)</label><div class="ad-preview" id="hs-prev"></div></div></div>' +
-      dailySectionHTML();
-
+  // The old fill-in-the-blank template editor (host_script) is retired — Claude now
+  // authors BOTH tiers, so everything lives in the one "AI Host briefing" section.
+  function drawHost(body) {
+    body.innerHTML = dailySectionHTML();
     const $ = function (id) { return document.getElementById(id); };
     bindDailySection($, body);
-    $('hs-scope').onchange = function () { drawHost(body, this.value); };
-    $('hs-add').onclick = function () {
-      const c = $('hs-new').value.trim().toLowerCase(); if (!c) return;
-      if (!scripts.find(function (s) { return s.scope === c; })) scripts.push({ scope: c, template: findScope('global').template, announcement: '', sponsor_message: '', enabled: true });
-      drawHost(body, c);
-    };
-    body.querySelectorAll('.ad-chip').forEach(function (ch) {
-      ch.onclick = function () { const ta = $('hs-tmpl'); ta.value += (ta.value && !/\s$/.test(ta.value) ? ' ' : '') + ch.dataset.ins; preview(); };
-    });
-    ['hs-tmpl', 'hs-ann', 'hs-spon'].forEach(function (id) { $(id).addEventListener('input', preview); });
-    function preview() {
-      let s = ($('hs-tmpl').value || '')
-        .replace(/\{city\}/g, scope === 'global' ? 'Toronto' : scope)
-        .replace(/\{count\}/g, '42').replace(/\{top\}/g, 'Summer Jazz Festival').replace(/\{featured\}/g, 'Night Market');
-      s = s.replace(/\s{2,}/g, ' ').trim();
-      if ($('hs-ann').value.trim()) s += ' ' + $('hs-ann').value.trim();
-      if ($('hs-spon').value.trim()) s += ' ' + $('hs-spon').value.trim();
-      $('hs-prev').textContent = s;
-    }
-    preview();
-    $('hs-save').onclick = function () {
-      const row = { scope: scope, template: $('hs-tmpl').value, announcement: $('hs-ann').value, sponsor_message: $('hs-spon').value, enabled: $('hs-en').checked, updated_at: new Date().toISOString() };
-      $('hs-save').disabled = true;
-      sb.from('host_script').upsert(row, { onConflict: 'scope' }).then(function (r) {
-        $('hs-save').disabled = false;
-        if (r.error) { $('hs-msg').textContent = 'Error: ' + r.error.message; $('hs-msg').style.color = '#b3402a'; return; }
-        const i = scripts.findIndex(function (s) { return s.scope === scope; });
-        if (i > -1) scripts[i] = row; else scripts.push(row);
-        $('hs-msg').textContent = 'Saved ✓'; $('hs-msg').style.color = '#3a7d44';
-      });
-    };
   }
 
   /* -------- Daily briefing (AI) — free device-voice, admin-controlled -------- */
@@ -268,14 +332,40 @@
         '<button class="ad-regen" data-scope="' + esc(r.scope) + '" data-day="' + esc(String(r.day)) + '">Regenerate</button></div>';
     }).join('');
     if (!rows) rows = '<div class="ad-li"><span class="ad-hint">No briefings cached yet.</span></div>';
-    return '<div class="ad-sec"><h2>Daily briefing (AI) — free, device voice</h2>' +
-      '<p class="ad-hint">The free “Today’s briefing” is written by Claude per cluster area and spoken by the phone’s own voice (no ElevenLabs). Steer it here; changes apply to briefings generated after you save — use “Clear” / “Regenerate” to refresh existing ones.</p>' +
-      '<label class="ad-toggle"><input type="checkbox" id="db-en"' + (enabled ? ' checked' : '') + '> Enabled</label>' +
-      '<div class="ad-field"><label>AI persona / tone (system prompt — blank = built-in default)</label>' +
+
+    // Sponsors manager (Phase 2): worldwide + city-targeted, appended verbatim.
+    let sponRows = dbSponsors.map(function (s) {
+      const prev = (s.message || '').slice(0, 60);
+      const win = (s.active_from || s.active_to) ? (' · ' + (s.active_from || '…') + '→' + (s.active_to || '…')) : '';
+      return '<div class="ad-li"><span>' + (s.enabled === false ? '⏸ ' : '') + '<b>' + esc(s.scope) + '</b> · w' + (s.weight || 1) + win +
+        ' — ' + esc(prev) + '…</span><span>' +
+        '<button class="ad-regen ad-spon-tog" data-id="' + esc(s.id) + '" data-en="' + (s.enabled === false ? '0' : '1') + '">' + (s.enabled === false ? 'Enable' : 'Disable') + '</button> ' +
+        '<button class="ad-regen ad-spon-del" data-id="' + esc(s.id) + '">Delete</button></span></div>';
+    }).join('');
+    if (!sponRows) sponRows = '<div class="ad-li"><span class="ad-hint">No sponsors yet.</span></div>';
+    const sponsors =
+      '<div class="ad-field" style="margin-top:20px"><label>Sponsors (' + dbSponsors.length + ') — FREE tier only, verbatim; worldwide + city-targeted</label>' +
+      '<p class="ad-hint">Paid sponsors play on the <b>free</b> tier only (Plus is ad-free). Scope <b>world</b> plays everywhere; a city name (e.g. <b>toronto</b>) plays only there. One worldwide + one city sponsor per briefing, rotated by weight. Verbatim — not written by Claude, edits apply instantly (no regeneration). For a message on BOTH tiers, use the Announcement above.</p>' +
+      '<div class="ad-list" id="db-spon-list">' + sponRows + '</div>' +
+      '<div class="ad-row" style="margin-top:10px">' +
+        '<div class="ad-field"><label>Scope</label><input id="db-spon-scope" placeholder="world   or   toronto"></div>' +
+        '<div class="ad-field"><label>Weight</label><input id="db-spon-weight" type="number" min="1" value="1"></div></div>' +
+      '<div class="ad-field"><label>Message (read aloud verbatim)</label><textarea id="db-spon-msg" placeholder="e.g. This briefing is brought to you by Acme Coffee — grab a cup on King Street."></textarea></div>' +
+      '<div class="ad-row"><div class="ad-field"><label>Active from (optional)</label><input id="db-spon-from" type="date"></div>' +
+        '<div class="ad-field"><label>Active to (optional)</label><input id="db-spon-to" type="date"></div></div>' +
+      '<div><button class="ad-save" id="db-spon-add">Add sponsor</button><span class="ad-saved" id="db-spon-ok"></span></div></div>';
+
+    return '<div class="ad-sec"><h2>AI Host briefing (Claude) — Free &amp; Plus</h2>' +
+      '<p class="ad-hint">One script provider for both tiers: Claude authors the briefing per cluster area. <b>Free</b> is spoken by the phone’s own voice; <b>Plus</b> is the same idea, longer &amp; richer, in the ElevenLabs premium voice. Steer both here — changes apply to briefings generated after you save.</p>' +
+      '<label class="ad-toggle"><input type="checkbox" id="db-en"' + (enabled ? ' checked' : '') + '> Enabled (both tiers)</label>' +
+      '<div class="ad-field"><label>Free persona / tone (system prompt — blank = built-in ~120-word default)</label>' +
       '<textarea id="db-persona" placeholder="e.g. You are the Eventually radio host — warm, upbeat, concise. Write a ~120-word spoken briefing…">' + esc(dbCfg.persona || '') + '</textarea></div>' +
-      '<div class="ad-field"><label>Announcement / sponsor line (appended verbatim to every briefing)</label>' +
+      '<div class="ad-field"><label>Plus premium persona (blank = built-in ~250-word default)</label>' +
+      '<textarea id="db-premium" placeholder="e.g. You are the Eventually premium host — warm, vivid, energetic. Write a ~250-word spoken briefing, 5–8 events grouped by vibe…">' + esc(dbCfg.premiumPersona || '') + '</textarea></div>' +
+      '<div class="ad-field"><label>Global announcement (read on BOTH tiers, verbatim)</label>' +
       '<textarea id="db-ann">' + esc(dbCfg.announcement || '') + '</textarea></div>' +
-      '<div><button class="ad-save" id="db-save">Save daily briefing</button><span class="ad-saved" id="db-msg"></span></div>' +
+      '<div><button class="ad-save" id="db-save">Save briefing settings</button><span class="ad-saved" id="db-msg"></span></div>' +
+      sponsors +
       '<div class="ad-field" style="margin-top:16px"><label>Cached briefings (' + dbRows.length + ')</label>' +
       '<div class="ad-list" id="db-list">' + rows + '</div>' +
       '<div style="margin-top:8px"><button class="ad-save ad-danger" id="db-clear">Clear today’s briefings</button></div></div></div>';
@@ -283,7 +373,7 @@
   function bindDailySection($, body) {
     const save = $('db-save');
     if (save) save.onclick = function () {
-      const patch = { dailyBriefing: { enabled: $('db-en').checked, persona: $('db-persona').value, announcement: $('db-ann').value } };
+      const patch = { dailyBriefing: { enabled: $('db-en').checked, persona: $('db-persona').value, premiumPersona: ($('db-premium') ? $('db-premium').value : (dbCfg.premiumPersona || '')), announcement: $('db-ann').value } };
       save.disabled = true;
       patchConfig(patch).then(function (r) {
         save.disabled = false;
@@ -304,6 +394,36 @@
       sb.rpc('admin_clear_daily_briefings', { p_scope: b.dataset.scope, p_day: b.dataset.day }).then(function () {
         const row = b.closest('.ad-li'); if (row) row.remove();
       });
+    });
+    // Sponsors: add / toggle / delete.
+    const addS = $('db-spon-add');
+    if (addS) addS.onclick = function () {
+      const scope = ($('db-spon-scope').value || '').trim().toLowerCase();
+      const message = ($('db-spon-msg').value || '').trim();
+      const ok = $('db-spon-ok');
+      if (!scope || !message) { ok.textContent = 'Scope + message required'; ok.style.color = '#b3402a'; return; }
+      const row = {
+        scope: scope, message: message,
+        weight: Math.max(1, parseInt($('db-spon-weight').value, 10) || 1),
+        active_from: $('db-spon-from').value || null, active_to: $('db-spon-to').value || null, enabled: true
+      };
+      addS.disabled = true;
+      sb.from('briefing_sponsors').insert(row).then(function (r) {
+        addS.disabled = false;
+        if (r.error) { ok.textContent = 'Error: ' + r.error.message; ok.style.color = '#b3402a'; return; }
+        renderHost(body);
+      });
+    };
+    const sList = $('db-spon-list');
+    if (sList) sList.addEventListener('click', function (e) {
+      const del = e.target.closest('.ad-spon-del');
+      const tog = e.target.closest('.ad-spon-tog');
+      if (del) {
+        if (!confirm('Delete this sponsor?')) return;
+        sb.from('briefing_sponsors').delete().eq('id', del.dataset.id).then(function () { renderHost(body); });
+      } else if (tog) {
+        sb.from('briefing_sponsors').update({ enabled: tog.dataset.en === '0' }).eq('id', tog.dataset.id).then(function () { renderHost(body); });
+      }
     });
   }
 
@@ -355,6 +475,91 @@
           const m = document.getElementById('bl-msg');
           if (r.error) { m.textContent = 'Error: ' + r.error.message; m.style.color = '#b3402a'; }
           else { m.textContent = 'Saved ✓ (applies on next app load)'; m.style.color = '#3a7d44'; }
+        });
+      };
+    });
+  }
+
+  /* ---------------- Subscriptions & Free Trial ---------------- */
+  // datetime-local <-> ISO helpers for the campaign window fields.
+  function toLocalInput(iso) {
+    if (!iso) return '';
+    const d = new Date(iso); if (isNaN(d.getTime())) return '';
+    const p = function (n) { return String(n).padStart(2, '0'); };
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + 'T' + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+  function fromLocalInput(v) { if (!v) return null; const d = new Date(v); return isNaN(d.getTime()) ? null : d.toISOString(); }
+
+  function renderSubscriptions(body) {
+    body.innerHTML = '<div class="ad-center">Loading subscriptions…</div>';
+    Promise.all([
+      sb.rpc('admin_subscriptions'),
+      sb.from('app_config').select('config').eq('id', 1).maybeSingle()
+    ]).then(function (res) {
+      const m = (res[0] && res[0].data) || null;
+      const merr = res[0] && res[0].error;
+      const cfg = (res[1].data && res[1].data.config) || {};
+      const t = cfg.trial || {};
+      const price = (cfg.plus && cfg.plus.priceMonthly != null) ? cfg.plus.priceMonthly : 7;
+
+      // --- metrics ---
+      let html = '<div class="ad-sec"><h2>Subscription metrics</h2>';
+      if (merr || !m || m.error) {
+        html += '<p class="ad-hint">Unavailable' +
+          (m && m.error ? ' (' + esc(m.error) + ')' : merr ? ' (' + esc(merr.message) + ')' : '') +
+          ' — run <code>backend/33_subscriptions.sql</code>, then reload.</p>';
+      } else {
+        const kpi = function (v, l) { return '<div class="ad-kpi"><b>' + esc(String(v == null ? '—' : v)) + '</b><span>' + esc(l) + '</span></div>'; };
+        html += '<div class="ad-grid">' +
+          kpi(m.plus_active, 'Active Plus') + kpi(m.trials_active, 'Active trials') +
+          kpi(m.trials_started, 'Trials started') + kpi(m.converted, 'Converted') +
+          kpi((m.conversion_rate || 0) + '%', 'Conversion rate') + kpi(m.canceling, 'Canceling') +
+          kpi(m.trial_expired, 'Trials expired') + kpi(m.expired, 'Plus expired') +
+          kpi('$' + (m.mrr_estimate || 0), '≈ MRR') +
+          '</div>' +
+          '<p class="ad-hint">Conversion = converted ÷ trials started. No-card trials don\'t convert until paid billing is wired, so this reads 0% for now. MRR ≈ active Plus × $' + esc(String(price)) + '/mo.</p>';
+      }
+      html += '</div>';
+
+      // --- trial policy editor ---
+      html += '<div class="ad-sec"><h2>Free trial settings</h2>' +
+        '<p class="ad-hint">Tune the Eventually Plus free trial with no code change — duration, availability, promotional window and messaging. Applies to new trials on next app load.</p>' +
+        '<label class="ad-toggle"><input type="checkbox" id="tr-enabled"' + (t.enabled !== false ? ' checked' : '') + '> Free trials enabled</label>' +
+        '<div class="ad-row">' +
+          '<div class="ad-field"><label>Trial length (days)</label><input id="tr-days" type="number" min="0" step="1" value="' + (t.days != null ? t.days : 3) + '"></div>' +
+          '<div class="ad-field"><label>Reminder lead (hours before end)</label><input id="tr-remind" type="number" min="0" step="1" value="' + (t.remindHoursBefore != null ? t.remindHoursBefore : 24) + '"></div>' +
+          '<div class="ad-field"><label>Plus price ($/mo · for MRR)</label><input id="tr-price" type="number" min="0" step="0.01" value="' + esc(String(price)) + '"></div>' +
+        '</div>' +
+        '<label class="ad-toggle"><input type="checkbox" id="tr-full"' + (t.fullAccess !== false ? ' checked' : '') + '> Grant full Plus access during trial</label>' +
+        '<label class="ad-toggle"><input type="checkbox" id="tr-pay"' + (t.requirePayment ? ' checked' : '') + '> Require payment details before trial <span class="ad-muted">— needs a live payment provider; leave OFF for the no-card trial</span></label>' +
+        '<div class="ad-row">' +
+          '<div class="ad-field"><label>Campaign start <span class="ad-muted">(optional)</span></label><input id="tr-start" type="datetime-local" value="' + esc(toLocalInput(t.startAt)) + '"></div>' +
+          '<div class="ad-field"><label>Campaign end <span class="ad-muted">(optional)</span></label><input id="tr-end" type="datetime-local" value="' + esc(toLocalInput(t.endAt)) + '"></div>' +
+        '</div>' +
+        '<div class="ad-field"><label>Trial message shown to users</label><textarea id="tr-txt">' + esc(t.message || '') + '</textarea></div>' +
+        '<div><button class="ad-save" id="tr-save">Save trial settings</button><span class="ad-saved" id="tr-saved"></span></div></div>';
+
+      body.innerHTML = html;
+
+      const saveBtn = document.getElementById('tr-save');
+      if (saveBtn) saveBtn.onclick = function () {
+        const trial = {
+          enabled:           document.getElementById('tr-enabled').checked,
+          days:              Math.max(0, parseInt(document.getElementById('tr-days').value, 10) || 0),
+          remindHoursBefore: Math.max(0, parseInt(document.getElementById('tr-remind').value, 10) || 0),
+          fullAccess:        document.getElementById('tr-full').checked,
+          requirePayment:    document.getElementById('tr-pay').checked,
+          startAt:           fromLocalInput(document.getElementById('tr-start').value),
+          endAt:             fromLocalInput(document.getElementById('tr-end').value),
+          message:           document.getElementById('tr-txt').value
+        };
+        const plus = { priceMonthly: parseFloat(document.getElementById('tr-price').value) || 0 };
+        saveBtn.disabled = true;
+        patchConfig({ trial: trial, plus: plus }).then(function (r) {
+          saveBtn.disabled = false;
+          const el = document.getElementById('tr-saved');
+          if (r.error) { el.textContent = 'Error: ' + r.error.message; el.style.color = '#b3402a'; }
+          else { el.textContent = 'Saved ✓'; el.style.color = '#3a7d44'; }
         });
       };
     });

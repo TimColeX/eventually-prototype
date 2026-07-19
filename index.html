@@ -13,6 +13,14 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="styles/main.css" />
+  <!-- GOOGLE ADSENSE (website / installed-PWA only — NOT native apps).
+       To activate real ads: (1) get approved at adsense.google.com (needs a custom
+       domain — GitHub Pages *.github.io is usually rejected), (2) uncomment the loader
+       below with your publisher id, (3) set ADSENSE.enabled/client/slots in src/monetize.js.
+       The ad containers (bottom banner, in-feed cards, detail panel) already reserve
+       space, so no layout shifts when this goes live.
+  <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-XXXXXXXXXXXXXXXX" crossorigin="anonymous"></script>
+  -->
 </head>
 <body>
   <!-- background -->
@@ -154,13 +162,15 @@
       </section>
 
       <section class="pf-plus">
-        <div class="pf-plus-h">Eventually <b>Plus</b></div>
+        <div class="pf-plus-h">Your AI Event <b>Concierge</b></div>
         <ul class="pf-plus-list">
-          <li>Ad-free · no sponsor reads</li>
-          <li>Advanced filtering & personalized Host</li>
-          <li>Travel tools, reminders & early access</li>
+          <li>Personalized daily briefings</li>
+          <li>Smart, interest-based recommendations</li>
+          <li>Travel-aware city briefings & reminders</li>
+          <li>Premium AI narration · ad-free</li>
         </ul>
-        <button class="pf-plus-btn">Go Plus — $7/mo</button>
+        <p class="pf-plus-status"></p>
+        <button class="pf-plus-btn">Unlock Plus — $7/mo</button>
         <p class="pf-fine">Demo only — no payment is taken.</p>
       </section>
 
@@ -221,6 +231,7 @@
   <script src="src/api.js"></script>
   <script src="src/auth.js"></script>
   <script src="src/billing.js"></script>
+  <script src="src/subscriptions.js"></script>
   <script src="src/geo.js"></script>
   <script src="src/hostvoice.js"></script>
   <script src="src/landdata.js"></script>

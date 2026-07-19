@@ -24,7 +24,13 @@
     this.synth = opts.synth || null;       // (text, lang, kind) -> Promise<url|null> (legacy per-line)
     this.getBriefing = opts.getBriefing || null;  // () -> Promise<{url,text}|null> (shared city briefing)
     this.getDailyBriefing = opts.getDailyBriefing || null;  // () -> Promise<{text}|null> (free daily briefing, device voice)
-    this.getOpener = opts.getOpener || null;      // () -> { text, lang, rtl } (personalized, browser voice)
+    this.onHomeReset = opts.onHomeReset || null;  // () -> void ("back to my area" clicked)
+    this.onMuteToggle = opts.onMuteToggle || null;  // () -> bool (new muted state)
+    this.initialMuted = !!opts.initialMuted;
+    this._premiumPlaying = false;
+    this._musicHold = false; this._freeMode = false; this._introDone = false;
+    this.getStinger = opts.getStinger || null;    // () -> Promise<{url,text}|null> (cached ElevenLabs intro, Plus)
+    this.getFreeGreeting = opts.getFreeGreeting || null;  // () -> Promise<{url,text}|null> (cached EL greeting, Free)
     this.getVoiceSettings = opts.getVoiceSettings || null;  // () -> { rate, pitch } (admin-tunable)
     // Voices can load asynchronously; refresh the best-voice pick when they arrive.
     if ('speechSynthesis' in global && global.speechSynthesis.addEventListener) {
@@ -56,13 +62,18 @@
       '<button class="ah-play" aria-label="Play the Host aloud">' +
         '<svg viewBox="0 0 24 24" class="ic-play"><path d="M8 5v14l11-7z"/></svg>' +
         '<svg viewBox="0 0 24 24" class="ic-pause" style="display:none"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>' +
+        '<span class="ah-cue" style="display:none" aria-hidden="true"></span>' +
       '</button>' +
       '<div class="ah-body">' +
-        '<div class="ah-label">eventually Host <span class="ah-live">● LIVE</span></div>' +
+        '<div class="ah-label">eventually Host <span class="ah-live">● LIVE</span><span class="ah-focus"></span></div>' +
         '<div class="ah-caption"><span class="ah-spon" style="display:none">SPONSORED</span>' +
         '<span class="ah-text"></span></div>' +
       '</div>' +
-      (this.getDailyBriefing ? '<button class="ah-briefing" aria-label="Play today\'s briefing">▶ Today’s briefing</button>' : '') +
+      '<button class="ah-home" style="display:none" aria-label="Back to my area">↩ My area</button>' +
+      '<button class="ah-mute" aria-label="Mute music" title="Mute music">' +
+        '<svg viewBox="0 0 24 24" class="ic-vol"><path d="M3 10v4h4l5 4V6L7 10H3z"/><path d="M15.5 8.5a4.5 4.5 0 010 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>' +
+        '<svg viewBox="0 0 24 24" class="ic-mute" style="display:none"><path d="M3 10v4h4l5 4V6L7 10H3z"/><path d="M15 9.5l5 5M20 9.5l-5 5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>' +
+      '</button>' +
       '<canvas class="ah-wave"></canvas>';
 
     this.canvas = this.el.querySelector('.ah-wave');
@@ -71,51 +82,296 @@
     this.textEl = this.el.querySelector('.ah-text');
     this.sponEl = this.el.querySelector('.ah-spon');
     this.el.querySelector('.ah-play').addEventListener('click', function () { self.toggle(); });
-    const brief = this.el.querySelector('.ah-briefing');
-    if (brief) brief.addEventListener('click', function () { self.playDailyBriefing(); });
+    const home = this.el.querySelector('.ah-home');
+    if (home) home.addEventListener('click', function () { if (self.onHomeReset) self.onHomeReset(); });
+    const mute = this.el.querySelector('.ah-mute');
+    if (mute) {
+      this._setMuteIcon(this.initialMuted);
+      mute.addEventListener('click', function (e) { e.stopPropagation(); self._setMuteIcon(self.onMuteToggle ? self.onMuteToggle() : false); });
+    }
+    // Tap the caption to open a readable "Now playing" transcript.
+    const cap = this.el.querySelector('.ah-caption');
+    if (cap) { cap.classList.add('ah-tappable'); cap.title = 'Tap to read the full transcript'; cap.addEventListener('click', function () { self._toggleExpand(); }); }
+    // Transcript panel (appended to body; overlays above the host bar).
+    const panel = document.createElement('div');
+    panel.className = 'ah-expand'; panel.style.display = 'none';
+    panel.innerHTML = '<div class="ah-exp-card"><div class="ah-exp-head"><span>Now playing — transcript</span>' +
+      '<button class="ah-exp-x" aria-label="Close">✕</button></div><div class="ah-exp-body" tabindex="0"></div></div>';
+    document.body.appendChild(panel);
+    this._panel = panel;
+    this._expBody = panel.querySelector('.ah-exp-body');
+    panel.querySelector('.ah-exp-x').addEventListener('click', function () { self._toggleExpand(false); });
+    panel.addEventListener('click', function (e) { if (e.target === panel) self._toggleExpand(false); });
   };
 
-  // Free "Today's briefing": a discrete ~45–60s spoken segment via the DEVICE voice.
-  // Speech must be primed inside this click (mobile), so unlock synchronously, then
-  // fetch the text and speak. When it finishes, the ambient live rotation resumes.
-  AIHost.prototype.playDailyBriefing = function () {
-    if (!this.getDailyBriefing) return;
+  // Show/hide the "back to my area" reset. Visible only when the Host is focused on
+  // a place other than the user's home (so there's somewhere to return to).
+  AIHost.prototype.setExploring = function (exploring, homeCity) {
+    const b = this.el.querySelector('.ah-home');
+    if (!b) return;
+    b.style.display = exploring ? '' : 'none';
+    b.textContent = '↩ My area';
+    if (homeCity) b.title = 'Back to ' + homeCity;
+  };
+
+  // The free show's OPENING: a short spoken intro (the narrator's greeting — or, on
+  // a location switch, the queued station ident) via the device voice, then Today's
+  // Briefing, then it flows into the ambient live rotation. One continuous listen.
+  AIHost.prototype._playOpening = function () {
     const self = this;
-    this._unlockSpeech();                    // MUST run inside the tap
-    this.speaking = true;
-    this._everPlayed = true;
-    this._openerDone = true;                 // skip the Plus opener for this path
-    this.icPlay.style.display = 'none';
-    this.icPause.style.display = '';
-    this.onPlay();                           // music bed on
-    if (this._timer) { clearInterval(this._timer); this._timer = null; }
-    clearTimeout(this._introTimer); clearTimeout(this._gapTimer);
-    const briefEl = this.el.querySelector('.ah-briefing');
-    if (briefEl) briefEl.disabled = true;
+    const line = this.getLine ? this.getLine() : null;   // greeting, or a queued 'ident' on a switch
+    const briefingThenAmbient = function () {
+      if (!self.speaking) return;
+      if (self._dailyBriefingDisabled) { self._afterSegment(); return; }   // admin-disabled → skip to ambient
+      self._speakDailyBriefing(function () { self._afterSegment(); });      // → GAP → ambient rotation
+    };
+    if (line && line.text) {
+      this._lang = line.lang || 'en-US';
+      this._showCaption(line);
+      this._browserSpeak(line.text, briefingThenAmbient);
+    } else {
+      briefingThenAmbient();
+    }
+  };
+
+  // Speak Today's Briefing via the DEVICE voice (free path). ~45–60s, Claude-authored
+  // server script (local-first) with a procedural fallback. Takes exclusive audio
+  // control so it never overlaps the live host. Calls onDone when finished.
+  AIHost.prototype._speakDailyBriefing = function (onDone) {
+    if (!this.getDailyBriefing) { if (onDone) onDone(); return; }
+    const self = this;
+    // Generation token: a mid-play location switch supersedes this fetch/speech.
+    const gen = (this._briefingGen = (this._briefingGen || 0) + 1);
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();   // exclusive audio
+    try { this._audio.pause(); } catch (e) {}
+    clearInterval(this._ampTimer);
+    this.briefingPlaying = true;
+    this._setBuffering(true);
     this._showCaption({ text: 'Preparing today’s briefing…', kind: 'briefing', lang: 'en-US' });
     this.getDailyBriefing().then(function (b) {
-      if (briefEl) briefEl.disabled = false;
-      if (!self.speaking) return;
+      if (gen !== self._briefingGen) return;                 // superseded
+      self._setBuffering(false);
+      if (!self.speaking) { self.briefingPlaying = false; return; }
       const text = b && b.text;
-      if (!text) { self._rotate(); return; }   // no briefing → fall into ambient rotation
+      if (!text) { self.briefingPlaying = false; if (onDone) onDone(); return; }
       self._lang = (b && b.lang) || 'en-US';
       self._showCaption({ text: text, kind: 'briefing', lang: self._lang, rtl: !!(b && b.rtl) });
-      self._browserSpeak(text, self._afterSegment.bind(self));   // after briefing → ambient
+      self._browserSpeak(text, function () {
+        if (gen !== self._briefingGen) return;
+        self.briefingPlaying = false;
+        if (onDone) onDone();
+      });
     }).catch(function () {
-      if (briefEl) briefEl.disabled = false;
-      if (self.speaking) self._rotate();
+      if (gen !== self._briefingGen) return;
+      self._setBuffering(false);
+      self.briefingPlaying = false;
+      if (onDone) onDone();
     });
   };
 
-  // Update the caption (no audio). Shared by line rotation + briefing mode.
+  // Free path per rotation: play the opening (intro + briefing) once per show, then
+  // fall into the ambient narrator rotation.
+  AIHost.prototype._freeSegment = function () {
+    if (!this._openingDone) { this._openingDone = true; this._playOpening(); }
+    else this._rotateLine();
+  };
+
+  // The focus city changed WHILE LISTENING. Finish the current sentence, then flow
+  // into the new city's opening (station ident → fresh briefing → live). Checked
+  // between sentences in _browserSpeak; if we're in a music gap, bring it forward.
+  AIHost.prototype.switchLocation = function () {
+    if (!this.speaking) return;
+    if (this._premiumPlaying) {                 // Plus: crossfade out the current clip, then switch
+      this._voiceVol(0, 0.5);
+      const self = this;
+      clearTimeout(this._switchFade);
+      this._switchFade = setTimeout(function () {
+        try { self._audio.pause(); } catch (e) {}
+        self._premiumPlaying = false; self._applySwitch();
+      }, 520);
+      return;
+    }
+    this._switchPending = true;                 // device: finish the current sentence, then switch
+    if (this._gapTimer) {                        // in a music gap → apply soon
+      clearTimeout(this._gapTimer);
+      const self = this;
+      this._gapTimer = setTimeout(function () { if (self.speaking) self._applySwitch(); }, 1200);
+    }
+  };
+  AIHost.prototype._applySwitch = function () {
+    this._switchPending = false;
+    this.briefingPlaying = false;
+    this._openingDone = false;                  // replay the opening (ident → briefing) for the new city
+    if (this.speaking) this._rotate();
+  };
+
+  // Admin toggle: when the daily briefing is disabled, the show plays intro → live
+  // (the briefing segment is skipped).
+  AIHost.prototype.setDailyBriefingEnabled = function (on) { this._dailyBriefingDisabled = (on === false); };
+
+  // Reflect the music mute state on the speaker button.
+  AIHost.prototype._setMuteIcon = function (m) {
+    const b = this.el.querySelector('.ah-mute'); if (!b) return;
+    b.classList.toggle('is-muted', !!m);
+    const v = b.querySelector('.ic-vol'), x = b.querySelector('.ic-mute');
+    if (v) v.style.display = m ? 'none' : '';
+    if (x) x.style.display = m ? '' : 'none';
+    b.title = m ? 'Unmute music' : 'Mute music'; b.setAttribute('aria-label', b.title);
+  };
+
+  // Fade the premium <audio> clip's volume (crossfades in/out). No-op ducking on iOS
+  // (volume is read-only there) — playback still switches promptly.
+  AIHost.prototype._voiceVol = function (to, secs) {
+    const a = this._audio; if (!a) return;
+    clearInterval(this._voiceTween);
+    const from = (typeof a.volume === 'number') ? a.volume : 1;
+    const steps = Math.max(1, Math.round(secs * 20)), dv = (to - from) / steps;
+    let i = 0; const self = this;
+    this._voiceTween = setInterval(function () {
+      i++; let vv = from + dv * i; vv = vv < 0 ? 0 : (vv > 1 ? 1 : vv);
+      try { a.volume = vv; } catch (e) {}
+      if (i >= steps) { try { a.volume = to < 0 ? 0 : (to > 1 ? 1 : to); } catch (e) {} clearInterval(self._voiceTween); self._voiceTween = null; }
+    }, 50);
+  };
+
+  // Buffering state (premium briefing being generated/synthesized) → the play button
+  // pulses and the caption shows a "preparing" hint, so silence never reads as a bug.
+  AIHost.prototype._setBuffering = function (on) {
+    this._buffering = !!on;
+    this.el.classList.toggle('ah-buffering', !!on);
+  };
+
+  // Show the focus city in the Host label (" · Toronto").
+  AIHost.prototype.setFocusCity = function (city) {
+    const f = this.el.querySelector('.ah-focus');
+    if (f) f.textContent = city ? ' · ' + city : '';
+  };
+  // Idle "new briefing ready" cue on the Play button (browsers block autoplay, so a
+  // location search while stopped can't start sound — it prompts a tap instead).
+  AIHost.prototype.setNewBriefingCue = function (on, city) {
+    const c = this.el.querySelector('.ah-cue');
+    if (c) c.style.display = on ? '' : 'none';
+    const play = this.el.querySelector('.ah-play');
+    if (play) {
+      play.classList.toggle('has-cue', !!on);
+      play.title = on ? ('New briefing for ' + (city || 'your area') + ' — tap to listen') : 'Play the Host aloud';
+    }
+  };
+
+  function escHtml(s) {
+    return String(s).replace(/[&<>"]/g, function (m) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[m]; });
+  }
+  // Tokenize text into word spans tagged with their char offsets (so speech word-
+  // boundary events can highlight the right word). Returns {html, meta:[{s,e}]}.
+  function wordsHTML(text) {
+    const parts = String(text).split(/(\s+)/);
+    let idx = 0, html = '';
+    const meta = [];
+    for (const p of parts) {
+      if (!p) continue;
+      if (/^\s+$/.test(p)) { html += p.replace(/ /g, '&nbsp;').replace(/\t/g, '&nbsp;&nbsp;'); idx += p.length; }
+      else { const s = idx, e = idx + p.length; meta.push({ s: s, e: e }); html += '<span class="ah-w" data-s="' + s + '">' + escHtml(p) + '</span>'; idx = e; }
+    }
+    return { html: html, meta: meta };
+  }
+  AIHost.prototype._reducedMotion = function () {
+    return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  };
+
+  // Update the caption (no audio). Renders the line as word spans so it can scroll
+  // and highlight the current word in sync with the narration. Shared by line
+  // rotation + briefing mode.
   AIHost.prototype._showCaption = function (line) {
     this.current = line;
     this.sponEl.style.display = line.kind === 'sponsor' ? '' : 'none';
     this.el.querySelector('.ah-caption').classList.toggle('is-sponsor', line.kind === 'sponsor');
-    this.textEl.setAttribute('dir', line.rtl ? 'rtl' : 'ltr');   // Arabic etc.
+    const rtl = !!line.rtl, text = line.text || '';
+    this.textEl.setAttribute('dir', rtl ? 'rtl' : 'ltr');
+    this._capText = text; this._words = null; this._activeWord = -1; this._synced = false;
+    this._stopMarquee();
     this.textEl.style.opacity = 0;
     const self = this;
-    setTimeout(function () { self.textEl.textContent = line.text; self.textEl.style.opacity = 1; }, 180);
+    clearTimeout(this._capTimer);
+    this._capTimer = setTimeout(function () {
+      const w = wordsHTML(text);
+      self.textEl.innerHTML = '<span class="ah-run">' + w.html + '</span>';
+      self._runEl = self.textEl.querySelector('.ah-run');
+      const spans = self._runEl.querySelectorAll('.ah-w');
+      self._words = w.meta.map(function (m, i) { m.el = spans[i]; return m; });
+      self._runEl.style.transform = 'translateX(0)';
+      self.textEl.style.opacity = 1;
+      self._maybeMarquee();
+      if (self._expanded) self._renderExpand(text, rtl);
+    }, 180);
+  };
+
+  // If the caption overflows and nothing is word-syncing it (premium audio, or no
+  // boundary events), gently ping-pong it so the whole line is readable.
+  AIHost.prototype._stopMarquee = function () {
+    clearTimeout(this._marqueeTimer); this._marqueeTimer = null;
+    if (this._runEl) this._runEl.style.transition = 'none';
+  };
+  AIHost.prototype._maybeMarquee = function () {
+    this._stopMarquee();
+    if (this._synced || this._reducedMotion() || !this._runEl) return;
+    const clip = this.textEl.clientWidth, run = this._runEl.scrollWidth;
+    if (run <= clip + 4) return;                 // fits — no scroll needed
+    const overflow = run - clip, self = this;
+    const dur = Math.max(3, overflow / 40);      // ~40 px/s
+    let out = true;
+    const step = function () {
+      if (!self._runEl || self._synced) return;
+      self._runEl.style.transition = 'transform ' + dur + 's linear';
+      self._runEl.style.transform = 'translateX(' + (out ? -overflow : 0) + 'px)';
+      self._marqueeTimer = setTimeout(function () { out = !out; step(); }, dur * 1000 + 1100);
+    };
+    this._marqueeTimer = setTimeout(step, 800);
+  };
+
+  // Highlight the word containing `charIdx` (a global offset into the caption text)
+  // and keep it in view. Called from speech word-boundary events (browser voice).
+  AIHost.prototype._highlightWord = function (charIdx) {
+    if (!this._words || !this._words.length) return;
+    this._synced = true; this._stopMarquee();
+    let wi = this._words.length - 1;
+    for (let i = 0; i < this._words.length; i++) {
+      if (charIdx < this._words[i].e) { wi = (charIdx >= this._words[i].s) ? i : Math.max(0, i - 1); break; }
+    }
+    if (wi === this._activeWord) return;
+    if (this._activeWord >= 0 && this._words[this._activeWord].el) this._words[this._activeWord].el.classList.remove('active');
+    this._activeWord = wi;
+    const el = this._words[wi].el; if (!el) return;
+    el.classList.add('active');
+    if (this._runEl && !this._reducedMotion()) {   // scroll the bar so the active word stays visible
+      const clip = this.textEl.clientWidth;
+      const maxShift = Math.max(0, this._runEl.scrollWidth - clip);
+      const shift = Math.min(Math.max(0, el.offsetLeft - clip * 0.33), maxShift);
+      this._runEl.style.transition = 'transform 0.35s ease';
+      this._runEl.style.transform = 'translateX(' + (-shift) + 'px)';
+    }
+    if (this._expanded && this._expWords && this._expWords[wi]) {   // mirror in the transcript panel
+      if (this._expActive >= 0 && this._expWords[this._expActive]) this._expWords[this._expActive].classList.remove('active');
+      this._expActive = wi; this._expWords[wi].classList.add('active');
+      try { this._expWords[wi].scrollIntoView({ block: 'center', behavior: this._reducedMotion() ? 'auto' : 'smooth' }); } catch (e) {}
+    }
+  };
+
+  // The expandable "Now playing" transcript (full text, wrapped, auto-highlighting).
+  AIHost.prototype._toggleExpand = function (force) {
+    this._expanded = (force === undefined) ? !this._expanded : !!force;
+    if (this._panel) this._panel.style.display = this._expanded ? '' : 'none';
+    if (this._expanded) this._renderExpand(this._capText || '', this.textEl.getAttribute('dir') === 'rtl');
+  };
+  AIHost.prototype._renderExpand = function (text, rtl) {
+    if (!this._expBody) return;
+    const w = wordsHTML(text);
+    this._expBody.setAttribute('dir', rtl ? 'rtl' : 'ltr');
+    this._expBody.innerHTML = w.html || '<span class="ah-hint">Press play to start the show.</span>';
+    this._expWords = this._expBody.querySelectorAll('.ah-w');
+    this._expActive = -1;
+    if (this._activeWord >= 0 && this._expWords[this._activeWord]) {
+      this._expActive = this._activeWord; this._expWords[this._activeWord].classList.add('active');
+    }
   };
 
   // After a spoken segment: swell music back, then leave a ~GAP before the next.
@@ -130,32 +386,104 @@
 
   AIHost.prototype._rotate = function () {
     if (!this.getLine) return;
+    if (this.briefingPlaying) return;          // the briefing owns the audio right now
+    if (this._musicHold) return;               // free intro done → music bed only, no caption rotation
     const self = this;
-    // Briefing mode (Plus): a personalized opener in the browser voice, then the
-    // SHARED, cached city briefing in the premium voice (cost-optimized "radio").
+    // Briefing mode: Plus = SHARED, cached ElevenLabs briefing (premium voice from the
+    // very first word — a cached stinger covers synth latency at the start). Free = the
+    // browser-voice show. getBriefing() resolves null for Free → the free show runs.
     if (this.speaking && this.getBriefing) {
-      if (!this._openerDone) {
+      // Start of the show (once per Play): play a cached ElevenLabs stinger IMMEDIATELY
+      // while the full briefing synthesizes in parallel — no browser-voice greeting.
+      if (!this._openerDone && (this.getStinger || this.getFreeGreeting)) {
         this._openerDone = true;
-        const op = this.getOpener ? this.getOpener() : null;
-        if (op && op.text) {
-          this._showCaption({ text: op.text, kind: 'greeting', lang: op.lang, rtl: op.rtl });
-          this._lang = op.lang || 'en-US';
-          this._browserSpeak(op.text, function () { if (self.speaking) self._rotate(); });
-          return;
-        }
+        this._setBuffering(true);
+        this._pendingBriefing = this.getBriefing ? this.getBriefing() : Promise.resolve(null);   // Plus fetch (parallel)
+        (this.getStinger ? this.getStinger() : Promise.resolve(null)).then(function (s) {
+          if (!self.speaking || self.briefingPlaying) return;
+          if (s && s.url) {                                   // PLUS: stinger → briefing (+ personalization)
+            self._setBuffering(false);
+            self._showCaption({ text: s.text, kind: 'greeting', lang: 'en-US' });   // stinger read-along
+            self._audioSpeak(s.url, s.text, function () { self._playPendingBriefing(); });
+          } else {                                            // FREE: one brief greeting, then STOP
+            self._pendingBriefing = null;
+            self._playFreeGreeting();
+          }
+        }).catch(function () { self._pendingBriefing = null; self._playFreeGreeting(); });
+        return;
       }
-      this.getBriefing().then(function (b) {
-        if (!self.speaking) return;
-        if (b && b.url) {
-          self._showCaption({ text: b.text, kind: 'briefing', lang: 'en-US' });
-          self._audioSpeak(b.url, b.text, self._afterSegment.bind(self));
-        } else {
-          self._rotateLine();    // not Plus / unavailable → free browser rotation
-        }
-      }).catch(function () { self._rotateLine(); });
+      // Refreshes / subsequent rotations: fetch + play the briefing (no stinger).
+      this._openerDone = true;
+      this._setBuffering(true);
+      this.getBriefing().then(function (b) { self._setBuffering(false); self._playBriefingResult(b); })
+        .catch(function () { self._setBuffering(false); self._freeSegment(); });
       return;
     }
     this._rotateLine();
+  };
+
+  // Plus: play the cached premium audio segments (briefing body + any verbatim promo
+  // clips) back-to-back, then a music GAP. Each clip is a pre-rendered ElevenLabs mp3.
+  AIHost.prototype._playPremiumSegments = function (segs, i) {
+    if (!this.speaking || this.briefingPlaying) return;
+    if (i >= segs.length) { this._afterSegment(); return; }   // done → GAP → refresh on next rotate
+    const seg = segs[i], self = this;
+    this._showCaption({ text: seg.text || '', kind: 'briefing', lang: 'en-US' });
+    this._audioSpeak(seg.url, seg.text || '', function () { self._playPremiumSegments(segs, i + 1); });
+  };
+
+  // FREE: play ONE brief cached ElevenLabs greeting, then STOP (no continuous show).
+  // NEVER uses the browser voice. If the ElevenLabs greeting is unavailable, it skips
+  // narration entirely and just lets the music bed play (→ _endFreeIntro).
+  AIHost.prototype._playFreeGreeting = function () {
+    const self = this;
+    this._freeMode = true;
+    if (!this.getFreeGreeting) { this._setBuffering(false); this._endFreeIntro(); return; }
+    this.getFreeGreeting().then(function (g) {
+      if (!self.speaking) return;
+      self._setBuffering(false);
+      if (g && g.segments && g.segments.length) self._playFreeIntro(g.segments, 0);
+      else self._endFreeIntro();                          // no clip → music only, no browser voice
+    }).catch(function () { self._setBuffering(false); self._endFreeIntro(); });
+  };
+  // Play the assembled free intro clips (ElevenLabs only), then stop narration but
+  // KEEP the music bed playing.
+  AIHost.prototype._playFreeIntro = function (segs, i) {
+    if (!this.speaking) return;
+    if (i >= segs.length) { this._endFreeIntro(); return; }
+    const seg = segs[i], self = this;
+    this._showCaption({ text: seg.text || '', kind: 'greeting', lang: 'en-US' });
+    this._audioSpeak(seg.url, seg.text || '', function () { self._playFreeIntro(segs, i + 1); }, true /* no browser fallback */);
+  };
+  // Free intro finished: narration stops, but the music bed keeps playing (uninterrupted)
+  // until the user pauses or mutes. The button now controls the music, not narration.
+  AIHost.prototype._endFreeIntro = function () {
+    this.speaking = false;
+    this._musicHold = true;                               // music continues on its own
+    this._introDone = true;
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+    try { this._audio.pause(); } catch (e) {}
+    clearInterval(this._voiceTween); clearTimeout(this._gapTimer); clearTimeout(this._introTimer);
+    this.onSpeakEnd();                                    // swell the music back up
+    this.icPlay.style.display = 'none';                   // button = "music playing"
+    this.icPause.style.display = '';
+    if (!this._timer) this._timer = setInterval(this._rotate.bind(this), this.IDLE);
+  };
+
+  // Play a resolved briefing result: Plus audio segments, else the free browser show.
+  AIHost.prototype._playBriefingResult = function (b) {
+    if (!this.speaking || this.briefingPlaying) return;
+    if (b && b.segments && b.segments.length) this._playPremiumSegments(b.segments, 0);
+    else this._freeSegment();               // Free / unavailable / failed → browser-voice fallback
+  };
+  // After the premium stinger, play the full briefing. If it isn't ready yet, hold on
+  // the music bed + buffering cue until it resolves (no browser voice in between).
+  AIHost.prototype._playPendingBriefing = function () {
+    if (!this.speaking) return;
+    const self = this, p = this._pendingBriefing; this._pendingBriefing = null;
+    this._setBuffering(true);
+    Promise.resolve(p).then(function (b) { self._setBuffering(false); self._playBriefingResult(b); })
+      .catch(function () { self._setBuffering(false); self._freeSegment(); });
   };
 
   // Classic per-line rotation (free browser voice, or per-line synth if provided).
@@ -184,21 +512,30 @@
   };
 
   // Premium voice: play the returned audio URL via the (gesture-unlocked) element.
-  AIHost.prototype._audioSpeak = function (url, text, afterSegment) {
+  // noFallback=true (FREE tier) → on failure, do NOT drop to the browser voice; just
+  // advance/finish (music-only). Free must never use the browser voice.
+  AIHost.prototype._audioSpeak = function (url, text, afterSegment, noFallback) {
     const self = this, a = this._audio;
+    if (this.briefingPlaying) return;                                  // never play premium over the briefing
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();  // enforce one voice: silence browser TTS
+    this.onSpeakStart();                                               // duck the music now
+    const fail = function () { self._premiumPlaying = false; if (noFallback) { if (afterSegment) afterSegment(); } else self._browserSpeak(text, afterSegment); };
     try {
-      a.onended = function () { afterSegment(); };
-      a.onerror = function () { self._browserSpeak(text, afterSegment); };
+      a.onended = function () { self._premiumPlaying = false; afterSegment(); };
+      a.onerror = fail;
       a.src = url; a.currentTime = 0;
+      try { a.volume = 0; } catch (e) {}                   // start silent → fade the clip in
       const p = a.play();
       const begin = function () {
+        self._premiumPlaying = true;
+        self._voiceVol(1, 0.35);                           // crossfade the clip in
         self.onSpeakStart();                               // duck music under voice
         clearInterval(self._ampTimer);
         self._ampTimer = setInterval(function () { self.amp = 0.5 + Math.random() * 0.4; }, 180);
       };
-      if (p && p.then) p.then(begin).catch(function () { self._browserSpeak(text, afterSegment); });
+      if (p && p.then) p.then(begin).catch(fail);
       else begin();
-    } catch (e) { self._browserSpeak(text, afterSegment); }
+    } catch (e) { fail(); }
   };
 
   // Free voice: browser SpeechSynthesis (or a timed simulation if unavailable).
@@ -206,6 +543,8 @@
   // a radio presenter), using the best available device voice + tuned rate/pitch.
   AIHost.prototype._browserSpeak = function (text, afterSegment) {
     const self = this;
+    try { this._audio.pause(); } catch (e) {}   // enforce one voice: silence the premium element first
+    this.onSpeakStart();                         // duck the music NOW (don't wait for onstart, which is flaky)
     if (!('speechSynthesis' in window)) {
       self.amp = 0.5;
       const read = Math.min(9000, 2600 + text.length * 45);
@@ -214,6 +553,10 @@
     }
     window.speechSynthesis.cancel();
     const sentences = self._splitSentences(text);
+    // Char offset of each sentence within `text`, so word-boundary charIndex (which
+    // is relative to the utterance) maps to a global position for caption sync.
+    const offsets = []; let cur = 0;
+    for (let s = 0; s < sentences.length; s++) { const at = text.indexOf(sentences[s], cur); offsets.push(at < 0 ? cur : at); cur = (at < 0 ? cur : at) + sentences[s].length; }
     const voice = self._voiceFor(self._lang || 'en-US');
     const cfg = self.getVoiceSettings ? (self.getVoiceSettings() || {}) : {};
     const rate = cfg.rate || 0.98;                        // slightly relaxed = more natural
@@ -222,12 +565,17 @@
     let i = 0;
     function next() {
       if (!self.speaking) return;
+      if (self._switchPending) { self._applySwitch(); return; }   // finish this sentence, then switch city
       if (i >= sentences.length) { afterSegment(); return; }
+      const si = i;                                        // capture for the boundary closure
       const u = new SpeechSynthesisUtterance(sentences[i]);
       u.lang = self._lang || 'en-US'; u.rate = rate; u.pitch = pitch; u.volume = 1.0;
       if (voice) u.voice = voice;
       if (i === 0) u.onstart = function () { self.amp = 0.6; self.onSpeakStart(); };   // duck once
-      u.onboundary = function () { self.amp = 0.55 + Math.random() * 0.35; };
+      u.onboundary = function (e) {
+        self.amp = 0.55 + Math.random() * 0.35;
+        if (e && (e.name === 'word' || e.charIndex != null)) self._highlightWord(offsets[si] + (e.charIndex || 0));
+      };
       u.onend = function () { i++; next(); };             // gap between utterances = a natural breath
       u.onerror = function () { i++; next(); };
       self._utters.push(u);                                // GC guard
@@ -245,11 +593,33 @@
     return out.length ? out : [t];
   };
 
-  AIHost.prototype.toggle = function () { this.speaking ? this.stop() : this.play(); };
+  AIHost.prototype.toggle = function () {
+    if (this.speaking) return this.stop();               // narration playing → stop everything
+    if (this._musicHold) return this._musicPause();      // free: music bed playing → stop the music
+    // Fully stopped. Free with the intro already played this session → just resume the
+    // music bed (don't replay the intro). Otherwise start the show/intro.
+    if (this._freeMode && this._introDone) return this._musicResume();
+    this.play();
+  };
+  // Music-only controls (free tier, after the intro).
+  AIHost.prototype._musicPause = function () {
+    this._musicHold = false;
+    this.onPause();                                      // stop the music bed
+    this.icPlay.style.display = ''; this.icPause.style.display = 'none';
+  };
+  AIHost.prototype._musicResume = function () {
+    this._musicHold = true;
+    this.onPlay();                                       // resume the music bed (no narration)
+    this.icPlay.style.display = 'none'; this.icPause.style.display = '';
+  };
 
   AIHost.prototype.play = function () {
     this.speaking = true;
-    this._openerDone = false;              // personalized opener plays once per session
+    this._musicHold = false; this._freeMode = false;
+    this._openerDone = false;              // premium stinger plays once per Play session
+    this._openingDone = false;             // replay the show opening (intro → briefing) on each Play
+    this._switchPending = false;
+    this.setNewBriefingCue(false);         // pressing Play consumes any "new briefing" cue
     this.icPlay.style.display = 'none';
     this.icPause.style.display = '';
     this._unlockSpeech();                   // MUST run inside the tap to enable mobile TTS
@@ -324,12 +694,18 @@
   };
   AIHost.prototype.stop = function () {
     this.speaking = false;
+    this.briefingPlaying = false;
+    this._switchPending = false;
+    this._premiumPlaying = false;
+    this._musicHold = false;
+    this._pendingBriefing = null;
+    this._setBuffering(false);
     this.icPlay.style.display = '';
     this.icPause.style.display = 'none';
     if ('speechSynthesis' in window) window.speechSynthesis.cancel();
     try { this._audio.pause(); } catch (e) {}
-    clearInterval(this._ampTimer);
-    clearTimeout(this._introTimer); clearTimeout(this._gapTimer); clearTimeout(this._readTimer);
+    clearInterval(this._ampTimer); clearInterval(this._voiceTween);
+    clearTimeout(this._introTimer); clearTimeout(this._gapTimer); clearTimeout(this._readTimer); clearTimeout(this._switchFade);
     this.onPause();                         // stop the music bed
     if (!this._timer) this._timer = setInterval(this._rotate.bind(this), this.IDLE);   // resume silent ticker
   };

@@ -7,6 +7,8 @@
   const P = window.EventuallyProfile;
   const M = window.EventuallyMonetize;
   const A = window.EventuallyAuth;
+  const S = window.EventuallySubscriptions;   // provider-agnostic subscription/trial service
+  let subState = null;                         // last my_subscription() result (null = unknown / RPCs not deployed / anon)
   const authReal = !!(A && A.enabled);
   // With real auth on, signed-in state comes ONLY from a live Supabase session
   // (set in onChange) — never from cached localStorage. This avoids showing a
@@ -27,7 +29,16 @@
   }
   // "You are here" + nearby-events (within NEAR_KM of the user's chosen location).
   let userLoc = null;
+  let freeIntroPlayed = false;          // the free upsell intro plays in full once per session
   const NEAR_KM = 50;
+  // "Events happening near you today" — live/upcoming within NEAR_KM of the user's
+  // location (or all upcoming if no location). Feeds the free intro's spoken count.
+  function nearCount() {
+    const loc = P.get().location || userLoc;
+    const upcoming = D.getEvents().filter(function (e) { const t = D.typeForDate(e, selectedDate); return t === 'live' || t === 'upcoming'; });
+    if (!loc) return 0;                 // no location → backend uses a generic (no-number) line
+    return upcoming.filter(function (e) { return haversineKm(loc.lat, loc.lon, e.lat, e.lon) <= NEAR_KM; }).length;
+  }
   function haversineKm(a1, o1, a2, o2) {
     const R = 6371, d = Math.PI / 180, dLat = (a2 - a1) * d, dLon = (o2 - o1) * d;
     const s = Math.sin(dLat / 2) * Math.sin(dLat / 2) + Math.cos(a1 * d) * Math.cos(a2 * d) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
@@ -260,13 +271,31 @@
   /* ---------- AI host ("eventually" Host) ---------- */
   // Captions rotate continuously; pressing play speaks them. The narrator pulls
   // from live events + the user's profile, with rate-limited sponsor reads.
+  // The location the AI host focuses on — follows the ACTIVE (viewed) location, not
+  // just home: set by the location chip (home), by searching, AND by tapping a city
+  // cluster. null → not yet set (fall back to home / worldwide).
+  let activeBriefingLocation = null;
   const narrator = window.EventuallyNarrator.create({
     data: D, profile: P, monetize: M,
-    selectedDate: function () { return selectedDate; }
+    selectedDate: function () { return selectedDate; },
+    // What the live DJ leads with: a searched/tapped city if set, else the user's
+    // home. `exploring` is true when that focus is a place other than home.
+    getFocus: function () {
+      const home = P.get().location || null;
+      const loc = activeBriefingLocation || home;
+      const city = (loc && loc.city) ? loc.city : null;
+      const exploring = !!(activeBriefingLocation && loc && (!home ||
+        (loc.city || '').toLowerCase() !== (home.city || '').toLowerCase()));
+      return { loc: loc, city: city, exploring: exploring };
+    }
   });
   const music = new window.EventuallyMusic();   // duckable bed, swaps to a real file if provided
+  // Music mute is a per-user preference (music only — narration always plays).
+  let musicMuted = false;
+  try { musicMuted = localStorage.getItem('ev_mute_music') === '1'; } catch (e) {}
+  music.setMuted(musicMuted);
   const I18n = window.EventuallyI18n;
-  new window.EventuallyAIHost(document.getElementById('ai-host'), {
+  const aiHost = new window.EventuallyAIHost(document.getElementById('ai-host'), {
     getLine: function () {                       // localize the structured line to the user's language
       let line = narrator.next();
       // Skip admin-disabled line types (cap attempts to avoid loops).
@@ -277,8 +306,9 @@
       const lang = P.get().language || 'en';
       const ov = RT.hostLines && RT.hostLines[line.kind];
       let text;
-      // English admin override (skip the greeting's no-recs form — it lacks the data).
-      if (lang === 'en' && ov && ov.text && !(line.kind === 'greeting' && line.data && !line.data.hasRecs)) {
+      // English admin override (skip the greeting's no-recs + exploring forms — the
+      // template has no override slot for those).
+      if (lang === 'en' && ov && ov.text && !(line.kind === 'greeting' && line.data && (!line.data.hasRecs || line.data.exploring))) {
         text = renderTemplate(ov.text, line.data || {});
       } else {
         text = I18n.format(line, lang);
@@ -289,31 +319,59 @@
     onPause: function () { music.stop(); },
     onSpeakStart: function () { music.duck(true); },   // duck under the voice
     onSpeakEnd: function () { music.duck(false); },    // swell between segments
-    // Cost-optimized "radio" model: a SHARED, cached ElevenLabs briefing per city
-    // (Plus only). null → the host uses the free browser-voice rotation.
+    // Cost-optimized "radio" model: a SHARED, cached ElevenLabs briefing keyed by
+    // CLUSTER CELL (Plus only) — a RICHER Claude script than the free tier, same
+    // location model. null → the host uses the free browser-voice rotation.
     getBriefing: function () {
       if (!window.EventuallyHostVoice || !window.EventuallyHostVoice.enabled) return Promise.resolve(null);
       if (!P.get().plus) return Promise.resolve(null);
-      const loc = P.get().location;
-      const city = (loc && loc.city) ? loc.city : null;   // null → worldwide briefing
-      return window.EventuallyHostVoice.getBriefing(city, P.get().language || 'en');
+      const loc = activeBriefingLocation || P.get().location;   // follows the searched/viewed cell
+      const city = (loc && loc.city) ? loc.city : null;
+      const now = new Date();
+      const day = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
+      // Personalization inputs (assembled into reusable cached clips server-side).
+      const interests = (P.effectiveInterests(D.getById) || []).slice(0, 3);
+      const saved = (P.get().saved || []).length;
+      return window.EventuallyHostVoice.getBriefing({
+        city: city, lat: loc && loc.lat, lon: loc && loc.lon, lang: P.get().language || 'en', day: day,
+        interests: interests, saved: saved
+      });
     },
-    // Personalized opener spoken in the FREE browser voice (no ElevenLabs cost).
-    getOpener: function () {
-      if (!P.get().plus) return null;
-      const p = P.get();
+    // Premium (Plus) is ElevenLabs from the very first word: a short, cached
+    // ElevenLabs stinger plays instantly while the full briefing synthesizes — no
+    // browser-voice greeting. (Free is browser voice throughout; Plus is premium
+    // throughout.) Returns null for Free → the free browser-voice show runs instead.
+    getStinger: function () {
+      if (!window.EventuallyHostVoice || !window.EventuallyHostVoice.enabled) return Promise.resolve(null);
+      if (!P.get().plus) return Promise.resolve(null);
+      return window.EventuallyHostVoice.getStinger(P.get().language || 'en');
+    },
+    // FREE: a brief cached ElevenLabs intro (count + upsell first time, short after),
+    // then narration stops and the music bed continues. Never the browser voice.
+    getFreeGreeting: function () {
+      if (!window.EventuallyHostVoice || !window.EventuallyHostVoice.enabled) return Promise.resolve(null);
+      if (P.get().plus) return Promise.resolve(null);
       const h = new Date().getHours();
       const part = h < 12 ? 'morning' : (h < 18 ? 'afternoon' : 'evening');
-      return { text: 'Good ' + part + (p.name ? ', ' + p.name : '') + ". Here's your Eventually briefing.",
-               lang: 'en-US', rtl: false };
+      const full = !freeIntroPlayed; freeIntroPlayed = true;
+      return window.EventuallyHostVoice.getFreeGreeting({ part: part, lang: P.get().language || 'en', count: nearCount(), full: full });
     },
     // Admin-tunable delivery for the free browser voice (rate/pitch).
     getVoiceSettings: function () { return RT.hostVoice || {}; },
+    // "Back to my area" — return the Host (and the map) to the user's home location.
+    onHomeReset: function () { backToMyArea(); },
+    // Mute/unmute the music bed only (narration keeps playing). Persisted.
+    initialMuted: musicMuted,
+    onMuteToggle: function () {
+      musicMuted = !musicMuted; music.setMuted(musicMuted);
+      try { localStorage.setItem('ev_mute_music', musicMuted ? '1' : '0'); } catch (e) {}
+      return musicMuted;
+    },
     // Free "Today's briefing" (device voice): prefer the LLM-authored server
     // script (local-first, worldwide fallback); if unavailable, build one locally
     // from the loaded events so the feature always works.
     getDailyBriefing: function () {
-      const loc = P.get().location;
+      const loc = activeBriefingLocation || P.get().location;   // brief the location you're viewing
       const city = (loc && loc.city) ? loc.city : null;
       const lang = P.get().language || 'en';
       const localDay = new Date();
@@ -329,6 +387,43 @@
         .catch(fallback);
     }
   });
+
+  // Point the AI host at a location (home OR a searched/navigated city). Relabels
+  // the "Today's briefing" button, and if a briefing is already playing, swaps it
+  // to the new location on the fly. (Browsers block auto-STARTING audio without a
+  // tap, so when idle we just relabel — the next tap plays the new location.)
+  function setActiveBriefingLocation(loc) {
+    const prevCity = (activeBriefingLocation && activeBriefingLocation.city) || null;
+    activeBriefingLocation = loc || null;
+    const city = (loc && loc.city) ? loc.city : null;
+    if (aiHost && aiHost.setFocusCity) aiHost.setFocusCity(city);
+    if (aiHost && aiHost.setExploring) aiHost.setExploring(isExploringNow(), (homeLoc() || {}).city || null);
+    if (!city || city === prevCity || !aiHost) return;
+    if (aiHost.speaking) {
+      // Listening → finish the current sentence, play a station ident, then this
+      // city's fresh briefing, then continue. One continuous experience.
+      if (narrator.announceFocus) narrator.announceFocus(city);   // queue the device-voice ident (free path)
+      if (aiHost.switchLocation) aiHost.switchLocation(city);
+    } else if (aiHost.setNewBriefingCue) {
+      // Stopped → browsers block autostarting audio, so cue a tap instead of playing.
+      aiHost.setNewBriefingCue(true, city);
+    }
+  }
+  function homeLoc() { return P.get().location || null; }
+  // Exploring = the Host is focused on a place other than the user's home.
+  function isExploringNow() {
+    const home = homeLoc(), a = activeBriefingLocation;
+    return !!(a && home && (a.city || '').toLowerCase() !== (home.city || '').toLowerCase());
+  }
+  // Return the Host + globe to the user's home area, clearing the searched focus.
+  function backToMyArea() {
+    const home = homeLoc();
+    if (!home) { window.EventuallyToast('Set your location first to use “my area”.'); return; }
+    setActiveBriefingLocation({ city: home.city, lat: home.lat, lon: home.lon });
+    globe.flyTo(home.lat, home.lon);
+    if (globe.setUserLocation) globe.setUserLocation(home.lat, home.lon);
+    window.EventuallyToast('Back in your area — ' + home.city + '.');
+  }
 
   // Compile a short spoken daily briefing locally from the loaded events — the
   // free fallback when the LLM briefing isn't available. Local-first (events in
@@ -445,15 +540,28 @@
 
   /* ---------- auth ---------- */
   const authEl = document.getElementById('auth');
-  function requireLogin(action) {
+  const authSubEl = authEl.querySelector('.auth-sub');
+  const AUTH_SUB_DEFAULT = authSubEl ? authSubEl.textContent : '';
+  // Gate an action behind a real account. If already signed in, run it now;
+  // otherwise stash it as pendingAction and open the sign-in modal — the action
+  // replays automatically after a successful sign-in (see finishLogin / onChange),
+  // so the user's original intent (e.g. "start Plus") is never lost. `reason`
+  // optionally swaps the modal subtitle so the prompt reflects why we're asking.
+  function requireLogin(action, reason) {
     if (user) { action(); return; }
     pendingAction = action;
-    openAuth();
+    openAuth(reason);
   }
   let pendingAction = null;
 
-  function openAuth() { authEl.classList.add('open'); }
-  function closeAuth() { authEl.classList.remove('open'); }
+  function openAuth(reason) {
+    if (authSubEl) authSubEl.textContent = reason || AUTH_SUB_DEFAULT;
+    authEl.classList.add('open');
+  }
+  function closeAuth() {
+    authEl.classList.remove('open');
+    if (authSubEl) authSubEl.textContent = AUTH_SUB_DEFAULT;   // restore default copy
+  }
 
   authEl.querySelector('.auth-close').addEventListener('click', closeAuth);
   authEl.querySelector('.auth-backdrop').addEventListener('click', closeAuth);
@@ -519,6 +627,35 @@
       });
   }
 
+  // Live countdown to an event start. Format adapts to how far off it is; under an
+  // hour it turns urgent. A single ticker (below) refreshes every second.
+  function fmtCountdown(delta) {
+    if (delta <= 0) return 'starting now';
+    const s = Math.floor(delta / 1000);
+    const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+    const p = function (n) { return n < 10 ? '0' + n : '' + n; };
+    return (d > 0 ? d + 'd ' : '') + p(h) + ':' + p(m) + ':' + p(sec);
+  }
+  // Countdown chip for the date line — only for still-upcoming events.
+  function countdownChip(ev) {
+    if (D.typeForDate(ev, selectedDate) !== 'upcoming') return '';
+    const ms = ev.date.getTime(), delta = ms - Date.now();
+    const urgent = delta > 0 && delta < 3600000 ? ' urgent' : '';
+    return ' <span class="ev-cd' + urgent + '" data-start="' + ms + '">⏳ ' + esc(fmtCountdown(delta)) + '</span>';
+  }
+  // One shared per-second ticker updates every countdown currently in the DOM
+  // (cards + detail) — no per-card timers. Only touches elements that exist.
+  function tickCountdowns() {
+    const now = Date.now();
+    document.querySelectorAll('.ev-cd[data-start]').forEach(function (el) {
+      const delta = (+el.dataset.start) - now;
+      el.textContent = '⏳ ' + fmtCountdown(delta);
+      el.classList.toggle('urgent', delta > 0 && delta < 3600000);
+      el.classList.toggle('now', delta <= 0);
+    });
+  }
+  setInterval(tickCountdowns, 1000);
+
   function eventCardHTML(ev) {
     const type = D.typeForDate(ev, selectedDate);
     const dateLabel = ev.date.toLocaleDateString(undefined,
@@ -539,7 +676,7 @@
             featured + badge +
           '</div>' +
           '<h4 class="ev-title">' + esc(ev.name) + '</h4>' +
-          '<p class="ev-date">' + dateLabel + '  ·  ' + esc(ev.city) + '</p>' +
+          '<p class="ev-date">' + dateLabel + '  ·  ' + esc(ev.city) + countdownChip(ev) + '</p>' +
           '<p class="ev-desc">' + esc(ev.description) + '</p>' +
           '<div class="ev-foot">' + srcs + '<span class="ev-view">View ›</span></div>' +
         '</div>' +
@@ -595,7 +732,15 @@
       shown = list.slice(0, PLACE_TOP);
       more = '<button class="see-all" data-seeall="1">See all ' + list.length + ' events ↓</button>';
     }
-    placeList.innerHTML = shown.map(eventCardHTML).join('') + more + partnerCardHTML(c);
+    // Interleave a native in-feed ad slot every AD_EVERY cards (non-Plus only).
+    const AD_EVERY = 4;
+    let cardsHtml = '';
+    shown.forEach(function (ev, i) {
+      cardsHtml += eventCardHTML(ev);
+      if (adsOn() && (i + 1) % AD_EVERY === 0 && i < shown.length - 1) cardsHtml += adSlot('infeed');
+    });
+    placeList.innerHTML = cardsHtml + more + partnerCardHTML(c);
+    M.mountAdSense(placeList);
     if (focusEventId) {
       const el = placeList.querySelector('.ev[data-id="' + focusEventId + '"]');
       if (el) { el.classList.add('focus'); el.scrollIntoView({ block: 'center' }); }
@@ -605,6 +750,7 @@
   function openPlace(clusterId, focusId) {
     const c = clusterById(clusterId);
     if (!c) return;
+    setActiveBriefingLocation({ city: c.city, lat: c.lat, lon: c.lon });   // tapping a cluster focuses the Host
     activeClusterId = clusterId; focusEventId = focusId || null;
     placeCat = 'all'; placeSort = 'soon'; placeExpanded = !!focusId;   // expand if jumping to a specific event
     const all = visibleEvents(c), n = all.length;
@@ -682,14 +828,16 @@
         '<div class="evd-badges">' + featured + badge + '</div>' +
         '<h2 class="evd-title">' + esc(ev.name) + '</h2>' +
         '<p class="evd-meta">' + esc(dateLabel) + ' · ' + timeLabel + '  —  ' + esc(ev.city) + '</p>' +
+        (type === 'upcoming' ? '<div class="evd-cd"><span class="cd-label">Starts in</span><span class="ev-cd" data-start="' + ev.date.getTime() + '">⏳ ' + esc(fmtCountdown(ev.date.getTime() - Date.now())) + '</span></div>' : '') +
         transparency +
         '<p class="evd-desc">' + esc(ev.description) + '</p>' +
         '<div class="evd-actions">' +
           '<button class="ev-like' + (ev.userLiked ? ' on' : '') + '" data-act="like">♥ <span class="n">' + ev.likes.toLocaleString() + '</span></button>' +
           '<button class="ev-attend' + (ev.userAttending ? ' on' : '') + '" data-act="attend">✓ <span class="n">' + ev.attending.toLocaleString() + '</span></button>' +
           '<button class="ev-save' + (P.isSaved(ev.id) ? ' on' : '') + '" data-act="save">' + (P.isSaved(ev.id) ? '★' : '☆') + '</button>' +
-        '</div>' + avail +
+        '</div>' + avail + adSlot('panel') +
       '</div>';
+    M.mountAdSense(eventScroll);
     eventEl.classList.add('open');
   }
   function closeEvent() { eventEl.classList.remove('open'); activeEventId = null; }
@@ -743,6 +891,8 @@
   // events that weren't on the loaded globe appear), then open it.
   function goToSearchResult(o) {
     searchResults.classList.remove('show'); searchInput.value = '';
+    // The AI host now follows the place you navigated to.
+    if (o.lat != null && o.lon != null) setActiveBriefingLocation({ city: o.city || null, lat: +o.lat, lon: +o.lon });
     function finish() {
       globe.flyTo(o.lat, o.lon);
       globe.setHighlight(o.lat, o.lon, { color: '#ff3b30', id: o.eventId });
@@ -755,17 +905,22 @@
       window.EventuallyAPI.fetchEvents({ minLat: o.lat - 0.4, maxLat: o.lat + 0.4, minLon: o.lon - 0.6, maxLon: o.lon + 0.6 })
         .then(function (evs) {
           if (evs && evs.length) { D.mergeEvents(evs); markMine(); globe.setClusters(D.getClusters()); refreshMarkers(); updateStats(); }
+          else if (o.explore && o.city) window.EventuallyToast('No events in ' + o.city + ' yet — showing the map. Check back soon.');
           finish();
         }).catch(finish);
     } else { finish(); }
   }
   function renderSearchResults(cities, events) {
     let html = cities.map(function (c) {
-      return '<button class="sr-city" data-lat="' + c.lat + '" data-lon="' + c.lon + '"><span class="dot city">📍</span>' +
-        esc(c.city) + '<small>' + c.n + ' event' + (c.n === 1 ? '' : 's') + '</small></button>';
+      // `explore` cities come from the geocoder (any place on Earth, even with no
+      // events yet) — jump there on the globe instead of showing an event count.
+      const sub = c.explore ? 'Explore on the map' : (c.n + ' event' + (c.n === 1 ? '' : 's'));
+      return '<button class="sr-city' + (c.explore ? ' sr-explore' : '') + '" data-lat="' + c.lat + '" data-lon="' + c.lon +
+        '" data-city="' + esc(c.city) + '"' + (c.explore ? ' data-explore="1"' : '') + '><span class="dot city">📍</span>' +
+        esc(c.city) + '<small>' + sub + '</small></button>';
     }).join('');
     html += events.map(function (e) {
-      return '<button data-ev="' + esc(e.id) + '" data-lat="' + e.lat + '" data-lon="' + e.lon + '"><span class="dot" style="background:' +
+      return '<button data-ev="' + esc(e.id) + '" data-lat="' + e.lat + '" data-lon="' + e.lon + '" data-city="' + esc(e.city || '') + '"><span class="dot" style="background:' +
         (e.color || '#CB5A3C') + '"></span>' + esc(e.name) + '<small>' + esc(e.city || '') + '</small></button>';
     }).join('');
     searchResults.innerHTML = html || '<div class="no-hits">No events found.</div>';
@@ -773,7 +928,7 @@
     searchResults.querySelectorAll('button').forEach(function (b) {
       b.addEventListener('click', function () {
         P.addSearch(searchInput.value);
-        goToSearchResult({ lat: +b.dataset.lat, lon: +b.dataset.lon, eventId: b.dataset.ev });
+        goToSearchResult({ lat: +b.dataset.lat, lon: +b.dataset.lon, eventId: b.dataset.ev, city: b.dataset.city, explore: b.dataset.explore === '1' });
       });
     });
   }
@@ -795,7 +950,12 @@
   let _searchTimer = null;
   searchInput.addEventListener('input', function () {
     const q = searchInput.value.trim();
-    if (!q) { searchResults.classList.remove('show'); return; }
+    if (!q) {
+      searchResults.classList.remove('show');
+      clearTimeout(_searchTimer);                    // drop any pending search
+      if (isExploringNow()) backToMyArea();          // clearing the box snaps back to your area
+      return;
+    }
     clearTimeout(_searchTimer);
     if (window.EventuallyAPI && window.EventuallyAPI.config.remote && window.EventuallyAPI.search) {
       // Backend search: finds ANY approved event in the database (not just loaded).
@@ -807,6 +967,19 @@
           const cities = Object.keys(byCity).map(function (k) { return byCity[k]; }).sort(function (a, b) { return b.n - a.n; }).slice(0, 4);
           const events = rows.slice(0, 6).map(function (e) { return { id: e.event_id, name: e.title, city: e.city, lat: e.lat, lon: e.lon, color: D.CATEGORIES[e.category] || '#CB5A3C' }; });
           renderSearchResults(cities, events);
+          // Geocoder fallback: when the DB has few/no matches for this query, let the
+          // user jump to ANY city on Earth (even with no events yet). Only fires on
+          // sparse results to keep Nominatim usage light; guarded against stale input.
+          if (cities.length < 3 && window.EventuallyGeo && q.length >= 3) {
+            window.EventuallyGeo.search(q, 1).then(function (list) {
+              if (searchInput.value.trim() !== q) return;                 // user kept typing
+              const g = (list || [])[0]; if (!g || !g.city) return;
+              const key = g.city.toLowerCase();
+              if (RT._hidCity[key] || cities.some(function (c) { return (c.city || '').toLowerCase() === key; })) return;
+              cities.push({ city: g.city, lat: g.lat, lon: g.lon, n: 0, explore: true });
+              renderSearchResults(cities, events);
+            }).catch(function () { /* geocoder unavailable — keep DB results */ });
+          }
         });
       }, 250);
     } else {
@@ -854,6 +1027,7 @@
   function setLocation(loc) {
     P.setLocation(loc); renderLocChip(); refreshProfile(); syncProfile();
     userLoc = { lat: loc.lat, lon: loc.lon };
+    setActiveBriefingLocation(loc);                                       // host briefs your home location
     if (globe.setUserLocation) globe.setUserLocation(loc.lat, loc.lon);   // "you are here" marker
     globe.flyTo(loc.lat, loc.lon);
     refreshMarkers();
@@ -917,10 +1091,11 @@
   });
   document.addEventListener('click', function (e) { if (!e.target.closest('.loc-wrap')) locMenu.classList.remove('show'); });
   renderLocChip();
-  // Restore the "you are here" marker if a location was saved previously.
+  // Restore the "you are here" marker + brief the saved location on startup.
   (function () {
     const loc = P.get().location;
     if (loc && loc.lat != null) { userLoc = { lat: loc.lat, lon: loc.lon }; if (globe.setUserLocation) globe.setUserLocation(loc.lat, loc.lon); }
+    setActiveBriefingLocation(loc || null);   // button reflects home; briefing follows it
   })();
 
   /* ---------- profile / "You" panel (personalization + Plus + notifications) ---------- */
@@ -939,7 +1114,7 @@
   function renderProfile() {
     const p = P.get();
     profileEl.querySelector('.pf-greeting').textContent = 'Hello ' + (p.name || 'there');
-    profileEl.querySelector('.pf-plus-state').textContent = p.plus ? 'Eventually Plus · active' : 'Free plan';
+    profileEl.querySelector('.pf-plus-state').textContent = plusStateLabel(subState);
     profileEl.querySelector('.pf-loc').textContent = p.location ? p.location.city : 'not set';
     profileEl.querySelector('.pf-saved-n').textContent = p.saved.length;
     profileEl.querySelector('.pf-interests').innerHTML = Object.keys(D.CATEGORIES).map(function (c) {
@@ -958,7 +1133,16 @@
     profileEl.querySelector('.pf-filter').classList.toggle('on', interestFilterActive);
     profileEl.querySelector('.pf-filter .tg-state').textContent = interestFilterActive ? 'On' : 'Off';
     profileEl.querySelector('.pf-filter').style.display = p.plus ? '' : 'none';
-    profileEl.querySelector('.pf-plus-btn').textContent = p.plus ? 'Cancel Plus (demo)' : 'Go Plus — $7/mo';
+    // Plus / trial CTA — label + behaviour driven by the effective subscription state.
+    const pb = plusButton(subState);
+    const plusBtn = profileEl.querySelector('.pf-plus-btn');
+    plusBtn.textContent = pb.label;
+    plusBtn.dataset.act = pb.act;
+    plusBtn.disabled = (pb.act === 'none');
+    const statusEl = profileEl.querySelector('.pf-plus-status');
+    if (statusEl) statusEl.textContent = plusStatusLine(subState);
+    const fineEl = profileEl.querySelector('.pf-fine');
+    if (fineEl) fineEl.textContent = plusFineLine(subState);
     profileEl.querySelector('.pf-logout').style.display = user ? '' : 'none';
     renderAccount();
     renderIdentities();
@@ -1195,7 +1379,13 @@
       });
     }, 350);
   });
-  profileEl.querySelector('.pf-plus-btn').addEventListener('click', goPlus);
+  profileEl.querySelector('.pf-plus-btn').addEventListener('click', function () {
+    const act = this.dataset.act;
+    if (act === 'cancel') return cancelPlusFlow();
+    if (act === 'resume') return resumePlusFlow();
+    if (act === 'none') return;               // trial used, no paid path yet
+    goPlus();                                 // trial / buy / demo — goPlus gates + branches
+  });
   profileEl.querySelector('.pf-notify').addEventListener('click', enableNotifications);
   profileEl.querySelector('.pf-filter').addEventListener('click', function () {
     interestFilterActive = !interestFilterActive;
@@ -1220,12 +1410,20 @@
 
   /* ---------- display ads + premium visibility ---------- */
   const adbar = document.getElementById('adbar');
+  // Show ads only to non-Plus users when the admin has ads enabled.
+  function adsOn() { return RT.adsEnabled && !P.get().plus; }
+  // A reserved ad container (banner | infeed | panel). Empty string when ads are
+  // off so nothing renders/reserves space. Provider-agnostic (house creative now,
+  // AdSense later) — see monetize.js adSlotHTML/mountAdSense.
+  function adSlot(kind) {
+    if (!adsOn()) return '';
+    return '<div class="ad-slot ad-' + kind + '" data-ad="' + kind + '">' + M.adSlotHTML(kind) + '</div>';
+  }
   function renderAd() {
-    const ad = M.randomAd();
-    adbar.innerHTML = '<span class="ad-tag">Ad</span>' +
-      '<div class="ad-body"><strong>' + esc(ad.brand) + '</strong><span>' + esc(ad.text) + '</span></div>' +
-      '<button class="ad-plus">Remove ads</button>';
-    adbar.querySelector('.ad-plus').addEventListener('click', openProfile);
+    adbar.innerHTML = M.adSlotHTML('banner');
+    M.mountAdSense(adbar);
+    const plus = adbar.querySelector('.ad-plus');
+    if (plus) plus.addEventListener('click', openProfile);
   }
   function applyMonetization() {
     const showAds = RT.adsEnabled && !P.get().plus;   // admin can disable ads globally
@@ -1321,7 +1519,7 @@
       '<details><summary>How do I save events?</summary><p>Tap the ☆ on any event card. Saved events feed your personalized recommendations from the Host.</p></details>' +
       '<details><summary>What is the eventually Host?</summary><p>Your live AI concierge — it narrates what\'s happening worldwide and tailors picks to your location and interests. Press play to hear it, with a music bed behind it.</p></details>' +
       '<details><summary>How do I list my event?</summary><p>Open the ⋯ menu → Create an event, drop a pin on the map, and publish straight to the globe.</p></details>' +
-      '<details><summary>What is Eventually Plus?</summary><p>An ad-free, sponsor-free membership with advanced filtering, a personalized Host, reminders and early access.</p></details>' +
+      '<details><summary>What is Eventually Plus?</summary><p>Your personal AI event concierge: personalized daily briefings, intelligent interest-based recommendations, travel-aware city briefings, saved-event reminders and premium AI narration — all ad-free and sponsor-free.</p></details>' +
       '</div>');
   }
   function openContact() {
@@ -1358,25 +1556,217 @@
     const p = P.get();
     const patch = { name: p.name, phone: p.phone, location: p.location, interests: p.interests,
                     notify: p.notify, language: p.language };
-    if (!billingEnabled()) patch.is_plus = p.plus;   // when billing is live, is_plus is server-only
+    // is_plus is NEVER written from the client — it's owned by the subscription RPCs
+    // (start_trial / cancel / the paid webhook) so a user can't self-grant Plus.
     A.saveProfile(patch);
     // Columns from 20_profile_details.sql — saved in a SEPARATE update so that if
     // that migration hasn't been run yet, the missing-column error can't block the
     // core fields above.
     A.saveProfile({ contact_email: p.contactEmail, address: p.address, comms: p.comms });
   }
+  // Copy shown on the sign-in modal when the user reaches it via an upgrade CTA,
+  // so the prompt reads as "start Plus", not a generic sign-in.
+  const PLUS_AUTH_REASON = 'Create an account or sign in to start Eventually Plus — your AI Event Concierge. We\'ll bring you right back.';
+  /* ---------- Eventually Plus: subscription + free-trial flow ----------
+     Effective Plus status is owned by the server (backend/33_subscriptions.sql).
+     `subState` = the last my_subscription() result; the app derives every Plus
+     affordance (ads off, premium voice, filter, the profile CTA) from it. Payment
+     is abstracted: this code never calls a provider — the no-card trial runs via
+     the RPCs, and paid checkout goes through the billing seam. */
+
+  // Human-friendly "time left" from a seconds count (e.g. "2 days", "5 hours", "12 min").
+  function humanRemaining(secs) {
+    if (secs == null) return '';
+    if (secs <= 0) return 'moments';
+    const d = Math.floor(secs / 86400), h = Math.floor((secs % 86400) / 3600), m = Math.floor((secs % 3600) / 60);
+    if (d >= 1) return d + ' day' + (d > 1 ? 's' : '') + (h ? ' ' + h + 'h' : '');
+    if (h >= 1) return h + ' hour' + (h > 1 ? 's' : '') + (m ? ' ' + m + 'm' : '');
+    return Math.max(1, m) + ' min';
+  }
+  // Header line under the greeting.
+  function plusStateLabel(s) {
+    if (!s) return P.get().plus ? 'Eventually Plus · active' : 'Free plan';
+    switch (s.state) {
+      case 'trial_active':    return 'Plus trial · ' + humanRemaining(s.seconds_remaining) + ' left';
+      case 'trial_canceling': return 'Plus trial · ' + humanRemaining(s.seconds_remaining) + ' left · won\'t renew';
+      case 'active':          return 'Eventually Plus · active';
+      case 'canceling':       return 'Eventually Plus · active ' + humanRemaining(s.seconds_remaining) + ' more';
+      case 'trial_expired':   return 'Free plan · trial ended';
+      case 'expired':         return 'Free plan · Plus expired';
+      case 'canceled':        return 'Free plan · canceled';
+      default:                return 'Free plan';
+    }
+  }
+  // The Plus panel CTA: { label, act }. act ∈ trial | cancel | resume | buy | demo | none.
+  function plusButton(s) {
+    if (s && (s.state === 'trial_canceling' || s.state === 'canceling')) return { label: 'Resume Plus', act: 'resume' };
+    if (s && s.is_plus)          return { label: 'Cancel Plus', act: 'cancel' };
+    if (s && s.trial_available)  return { label: 'Start ' + (s.trial_days || 3) + '-day free trial', act: 'trial' };
+    if (s && s.trial_used)       return billingEnabled() ? { label: 'Get Eventually Plus', act: 'buy' } : { label: 'Free trial already used', act: 'none' };
+    if (!s)                      return { label: P.get().plus ? 'Cancel Plus (demo)' : 'Go Plus — $7/mo', act: 'demo' };  // RPCs not deployed
+    return billingEnabled() ? { label: 'Get Eventually Plus', act: 'buy' } : { label: 'Go Plus — $7/mo', act: 'demo' };
+  }
+  // Supporting status line inside the Plus card.
+  function plusStatusLine(s) {
+    if (!s) return '';
+    switch (s.state) {
+      case 'trial_active':    return 'Your free trial is active — full concierge access. Cancel anytime before it ends.';
+      case 'trial_canceling': return 'Your trial won\'t renew. You keep full access until it ends.';
+      case 'active':          return 'Thanks for being on Plus — your AI Event Concierge is fully unlocked.';
+      case 'canceling':       return 'Your plan won\'t renew. You keep access until the period ends.';
+      case 'trial_expired':   return 'Your free trial has ended. Start Plus to keep personalized briefings and premium discovery.';
+      case 'expired':         return 'Your Plus has expired. Renew to restore your concierge.';
+      case 'canceled':        return 'Your Plus is canceled. Come back anytime.';
+      default:                return s.trial_available ? (s.trial_message || '') : '';
+    }
+  }
+  // Fine print under the CTA.
+  function plusFineLine(s) {
+    if (s && s.trial_available)  return 'No charge during your trial. Cancel anytime.';
+    if (s && s.is_plus)          return billingEnabled() ? 'Manage billing from your email receipts.' : 'No payment is taken in this build.';
+    if (!s || !billingEnabled()) return 'No payment is taken in this build.';
+    return '';
+  }
+
+  // Push the effective status into the UI (P.plus mirror + monetization + panels + reminder).
+  function applySub(s) {
+    subState = s || null;
+    if (s && typeof s.is_plus === 'boolean' && P.get().plus !== s.is_plus) P.setPlus(s.is_plus);
+    applyMonetization(); renderMenuTrigger();
+    if (profileEl.classList.contains('open')) renderProfile();
+    scheduleTrialReminder(s);
+  }
+  // Fetch the authoritative status (called after sign-in and on demand).
+  function refreshSubscription() {
+    if (!S || !acctEnabled()) { return Promise.resolve(null); }
+    return S.getStatus().then(function (s) { applySub(s); maybeNotifyTrial(s); return s; });
+  }
+
+  // Upgrading to Plus ALWAYS requires a real account (every entry point funnels
+  // through here). Once authed we pick the best path: no-card free trial → paid
+  // checkout → (pre-deploy) demo toggle. Cancelling/resuming is handled separately.
   function goPlus() {
-    if (billingEnabled()) {
-      if (P.get().plus) { window.EventuallyToast("You're on Eventually Plus — manage it from your email receipts."); return; }
-      requireLogin(function () {
+    if (subState && subState.is_plus) { openProfile(); return; }   // already Plus → manage
+    requireLogin(function () { beginUpgrade(); }, PLUS_AUTH_REASON);
+  }
+  function beginUpgrade() {
+    // Re-check server truth now that we're authenticated.
+    (S ? S.getStatus() : Promise.resolve(null)).then(function (s) {
+      if (!s) {   // subscription RPCs not deployed yet → legacy demo toggle (still login-gated)
+        P.setPlus(true); applyMonetization(); renderProfile(); renderMenuTrigger(); syncProfile();
+        window.EventuallyToast('Welcome to Eventually Plus (demo).');
+        return;
+      }
+      applySub(s);
+      if (s.is_plus) { openProfile(); return; }
+      if (s.trial_available) { startTrialFlow(); return; }
+      if (billingEnabled()) {
         window.EventuallyToast('Opening secure checkout…');
         window.EventuallyBilling.startPlusCheckout({ id: user.id, email: user.email });
-      });
+        return;
+      }
+      window.EventuallyToast(s.trial_used ? 'Your free trial has already been used.' : 'Eventually Plus is coming soon.');
+      openProfile();
+    });
+  }
+  function trialErr(reason) {
+    switch (reason) {
+      case 'trial_already_used': return 'You\'ve already used your free trial.';
+      case 'trials_disabled':    return 'Free trials aren\'t available right now.';
+      case 'campaign_ended':     return 'This trial promotion has ended.';
+      case 'not_started':        return 'This trial promotion hasn\'t started yet.';
+      case 'already_subscribed': return 'You\'re already on Eventually Plus.';
+      default:                   return 'Could not start your trial — please try again.';
+    }
+  }
+  function startTrialFlow() {
+    window.EventuallyToast('Starting your free trial…');
+    S.startTrial().then(function (res) {
+      if (res && res.ok) {
+        applySub(res);
+        window.EventuallyToast('Your ' + (res.trial_days || 3) + '-day Eventually Plus trial is live — enjoy your AI Event Concierge.');
+        openProfile();
+      } else {
+        window.EventuallyToast(trialErr(res && res.reason));
+        refreshSubscription();
+      }
+    }).catch(function () { window.EventuallyToast('Could not start your trial — please try again.'); });
+  }
+  function cancelPlusFlow() {
+    if (!S || !acctEnabled() || !subState) {   // demo fallback (RPCs not deployed)
+      P.setPlus(false); applyMonetization(); renderProfile(); renderMenuTrigger();
+      window.EventuallyToast('Eventually Plus cancelled (demo).');
       return;
     }
-    // demo (no billing configured): mock toggle
-    P.setPlus(!P.get().plus); applyMonetization(); renderProfile(); renderMenuTrigger(); syncProfile();
-    window.EventuallyToast(P.get().plus ? 'Welcome to Eventually Plus — ads & sponsor reads off (demo).' : 'Eventually Plus cancelled (demo).');
+    const ending = subState.seconds_remaining ? humanRemaining(subState.seconds_remaining) : null;
+    openModal('Cancel Eventually Plus',
+      '<p class="modal-lead">You\'ll keep full Plus access' +
+        (ending ? ' for the remaining <b>' + ending + '</b>' : ' until your period ends') +
+        ', then move to the free plan. No charge either way.</p>' +
+      '<div class="ps-actions"><button type="button" class="ps-skip" data-x="keep">Keep Plus</button>' +
+      '<button type="button" class="ps-save cx-danger" data-x="cancel">Cancel Plus</button></div>',
+      function (body) {
+        body.querySelector('[data-x="keep"]').addEventListener('click', closeModal);
+        body.querySelector('[data-x="cancel"]').addEventListener('click', function () {
+          closeModal();
+          S.cancel().then(function (res) {
+            if (res && res.ok) {
+              applySub(res);
+              window.EventuallyToast('Your Plus won\'t renew' + (res.seconds_remaining ? ' — access continues for ' + humanRemaining(res.seconds_remaining) : '') + '.');
+            } else { window.EventuallyToast('Could not cancel — please try again.'); }
+          });
+        });
+      });
+  }
+  function resumePlusFlow() {
+    if (!S) return;
+    S.resume().then(function (res) {
+      if (res && res.ok) { applySub(res); window.EventuallyToast('Welcome back — your Eventually Plus will continue.'); }
+      else { window.EventuallyToast('Could not resume — please try again.'); }
+    });
+  }
+
+  // In-app trial notices (once each): a nudge when the trial is ending soon, and a
+  // note when it has ended. Keyed in localStorage so we don't nag on every load.
+  function maybeNotifyTrial(s) {
+    if (!s) return;
+    const KEY = 'eventually.trialNotice.v1';
+    let seen = {}; try { seen = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch (e) {}
+    function mark(k) { seen[k] = 1; try { localStorage.setItem(KEY, JSON.stringify(seen)); } catch (e) {} }
+    const endKey = s.trial_end ? Math.floor(new Date(s.trial_end).getTime() / 3600000) : 0;
+    if (s.state === 'trial_active' && s.seconds_remaining != null &&
+        s.seconds_remaining <= (s.remind_hours_before || 24) * 3600) {
+      const k = 'ending:' + endKey;
+      if (!seen[k]) { mark(k); window.EventuallyToast('Your Eventually Plus trial ends in ' + humanRemaining(s.seconds_remaining) + '. Cancel anytime before then.'); }
+    }
+    if (s.state === 'trial_expired' && !seen['expired:' + endKey]) {
+      mark('expired:' + endKey);
+      window.EventuallyToast('Your Eventually Plus trial has ended. Start Plus to keep your AI Event Concierge.');
+    }
+  }
+  // Local device reminder before the trial ends (in-session tier, like reminders.js):
+  // arms a timer when within ~26h and Notification permission is granted.
+  let _trialTimer = null;
+  function scheduleTrialReminder(s) {
+    if (_trialTimer) { clearTimeout(_trialTimer); _trialTimer = null; }
+    if (!s || s.state !== 'trial_active' || !s.trial_end) return;
+    if (!window.EventuallyReminders || !window.EventuallyReminders.permitted()) return;
+    const fireAt = new Date(s.trial_end).getTime() - (s.remind_hours_before || 24) * 3600000;
+    const delay = fireAt - Date.now();
+    if (delay < -60000 || delay > 26 * 3600000) return;    // near-term only, while open
+    const RKEY = 'eventually.trialReminder.fired';
+    const stamp = String(Math.floor(new Date(s.trial_end).getTime() / 86400000));
+    if (localStorage.getItem(RKEY) === stamp) return;
+    _trialTimer = setTimeout(function () {
+      try { localStorage.setItem(RKEY, stamp); } catch (e) {}
+      try {
+        if (navigator.serviceWorker && navigator.serviceWorker.ready) {
+          navigator.serviceWorker.ready.then(function (reg) {
+            reg.showNotification('Eventually Plus', { body: 'Your free trial ends soon — keep your AI Event Concierge by staying on Plus.', icon: 'assets/icon.svg', tag: 'trial-ending' });
+          });
+        } else { new Notification('Eventually Plus', { body: 'Your free trial ends soon.', icon: 'assets/icon.svg' }); }
+      } catch (e) {}
+    }, Math.max(0, delay));
   }
   // After a native event is published with "Feature" ticked, settle the placement:
   // a Plus member's monthly free quota first, otherwise a one-off checkout.
@@ -1430,6 +1820,7 @@
       if (!u) {
         const was = user; user = null;
         // Plus is account-bound — never leave a cached Plus state active without a session.
+        subState = null;
         if (P.get().plus) { P.setPlus(false); applyMonetization(); }
         renderMenuTrigger(); refreshProfile();
         if (was) window.EventuallyToast('Signed out.');
@@ -1467,6 +1858,7 @@
         if (A.myEvents) A.myEvents().then(function (rows) { myEventIds = (rows || []).map(function (r) { return r.event_id; }); markMine(); });
         renderMenuTrigger(); renderLocChip(); applyMonetization(); refreshMarkers(); refreshProfile();
         syncReminders();                  // saved list changed after sign-in
+        refreshSubscription();            // authoritative Plus/trial state (overrides the is_plus mirror)
         if (eventEl.classList.contains('open') && activeEventId) openEvent(activeEventId);
         if (place.classList.contains('open')) rerenderPlace();
         window.EventuallyToast('Signed in' + (user.name ? ' — welcome, ' + user.name + '.' : '.'));
@@ -1503,9 +1895,9 @@
         if (cfg.pinnedLocations) RT.pinned = cfg.pinnedLocations;
         if (cfg.hiddenCities) RT.hiddenCities = cfg.hiddenCities;
         if (cfg.hiddenEvents) RT.hiddenEvents = cfg.hiddenEvents;
-        // Admin can disable the free daily briefing → hide the "Today's briefing" button.
-        if (cfg.dailyBriefing && cfg.dailyBriefing.enabled === false) {
-          const bb = document.querySelector('.ah-briefing'); if (bb) bb.style.display = 'none';
+        // Admin can disable the free daily briefing → the show skips the briefing segment.
+        if (cfg.dailyBriefing && aiHost.setDailyBriefingEnabled) {
+          aiHost.setDailyBriefingEnabled(cfg.dailyBriefing.enabled !== false);
         }
         applyHidden();
         refreshMarkers(); applyMonetization();
